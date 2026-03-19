@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Zulu Poker Tracker PUBLIC
 // @namespace    zulu.ws.tracker.public
-// @version      4.2.0
-// @description  Torn Poker Tracker pubblico con whitelist + custom key + HUD inline
+// @version      1.1.0
+// @description  ATorn Poker Utility
 // @match        https://www.torn.com/page.php?sid=holdem*
 // @match        https://www.torn.com/pda.php?sid=holdem*
 // @match        https://www.torn.com/loader.php?sid=holdem*
