@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ATornPokerUtility
 // @namespace    zulu.atornpoker.utility
-// @version      4.3.0
+// @version      4.3.1
 // @description  Torn Poker HUD with whitelist auth, persistent server stats and inline player overlays
 // @match        https://www.torn.com/page.php?sid=holdem*
 // @match        https://www.torn.com/pda.php?sid=holdem*
@@ -24,7 +24,7 @@
     globalWindow.__A_TORN_POKER_UTILITY__ = true;
 
     const SERVER = "https://torn-poker-server-production.up.railway.app";
-    const SCRIPT_VERSION = "4.3.0";
+    const SCRIPT_VERSION = "4.3.1";
 
     const LS = {
         tornKey: "atpu.tornKey",
