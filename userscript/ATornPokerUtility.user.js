@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Zulu Poker Tracker PUBLIC
-// @namespace    zulu.ws.tracker.public
-// @version      1.1.0
-// @description  ATorn Poker Utility
+// @name         ATornPokerUtility
+// @namespace    zulu.atornpoker.utility
+// @version      4.3.0
+// @description  Torn Poker HUD with whitelist auth, persistent server stats and inline player overlays
 // @match        https://www.torn.com/page.php?sid=holdem*
 // @match        https://www.torn.com/pda.php?sid=holdem*
 // @match        https://www.torn.com/loader.php?sid=holdem*
@@ -12,25 +12,26 @@
 // @connect      torn-poker-server-production.up.railway.app
 // @connect      api.torn.com
 // @run-at       document-start
+// @updateURL    https://raw.githubusercontent.com/zulu-lab/ATornPokerUtility/main/userscript/ATornPokerUtility.user.js
+// @downloadURL  https://raw.githubusercontent.com/zulu-lab/ATornPokerUtility/main/userscript/ATornPokerUtility.user.js
 // ==/UserScript==
 
 (function () {
     "use strict";
 
-    const globalWindow = (typeof unsafeWindow !== "undefined") ? unsafeWindow : window;
-    if (globalWindow.__ZULU_POKER_TRACKER_PUBLIC__) return;
-    globalWindow.__ZULU_POKER_TRACKER_PUBLIC__ = true;
+    const globalWindow = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
+    if (globalWindow.__A_TORN_POKER_UTILITY__) return;
+    globalWindow.__A_TORN_POKER_UTILITY__ = true;
 
     const SERVER = "https://torn-poker-server-production.up.railway.app";
-    const SCRIPT_VERSION = "4.2.0-public";
+    const SCRIPT_VERSION = "4.3.0";
 
     const LS = {
-        tornKey: "zuluPokerPublic.tornKey",
-        ownerId: "zuluPokerPublic.ownerId",
-        ownerName: "zuluPokerPublic.ownerName",
-        publicToken: "zuluPokerPublic.publicToken",
-        publicEnabled: "zuluPokerPublic.publicEnabled",
-        lastBootstrapAt: "zuluPokerPublic.lastBootstrapAt"
+        tornKey: "atpu.tornKey",
+        ownerId: "atpu.ownerId",
+        ownerName: "atpu.ownerName",
+        publicToken: "atpu.publicToken",
+        publicEnabled: "atpu.publicEnabled"
     };
 
     const STATE = {
@@ -52,21 +53,22 @@
         playerHudLoopStarted: false,
         flushLoopStarted: false,
         sessionStarted: false,
+        persistedFetchLoopStarted: false,
 
         lastFlush: "-",
         lastAction: "-",
-        lastInfo: "idle"
+        lastPersistFetchAt: 0
     };
 
-    const PLAYER_STATS = {};   // userId -> { name, hands, vpipHands, pfrHands }
-    const LAST_ACTION = {};    // dedupe actions
-
-    // --------------------------------------------------
-    // utils
-    // --------------------------------------------------
+    const PLAYER_STATS = {};
+    const LAST_ACTION_DEDUPE = {};
 
     function safeParse(text, fallback = null) {
-        try { return JSON.parse(text); } catch { return fallback; }
+        try {
+            return JSON.parse(text);
+        } catch {
+            return fallback;
+        }
     }
 
     function setLS(key, value) {
@@ -85,7 +87,9 @@
     }
 
     function delLS(key) {
-        try { localStorage.removeItem(key); } catch {}
+        try {
+            localStorage.removeItem(key);
+        } catch {}
     }
 
     function req(method, url, headers, body, cb) {
@@ -118,18 +122,6 @@
         req(method, SERVER + path, headers, body, cb);
     }
 
-    function reqTorn(path, cb) {
-        if (!STATE.tornKey) {
-            cb(new Error("missing torn key"), null);
-            return;
-        }
-        req("GET", "https://api.torn.com" + path + (path.includes("?") ? "&" : "?") + "key=" + encodeURIComponent(STATE.tornKey), {}, null, cb);
-    }
-
-    function byId(id) {
-        return document.getElementById(id);
-    }
-
     function waitForBody(fn) {
         if (document.body) return fn();
         setTimeout(() => waitForBody(fn), 250);
@@ -142,207 +134,46 @@
         return Number.isFinite(num) ? num : null;
     }
 
-    function statusLabel() {
-        if (!STATE.tornKey) return "NO KEY";
-        if (!STATE.ownerTornId) return "NO ID";
-        if (!STATE.authorized) return "BLOCKED";
-        return "ON";
+    function normalizeName(name) {
+        return String(name || "").trim();
     }
 
-    // --------------------------------------------------
-    // settings ui
-    // --------------------------------------------------
-
-    function mountSettingsUI() {
-        if (STATE.settingsMounted || !document.body) return;
-        STATE.settingsMounted = true;
-
-        const btn = document.createElement("button");
-        btn.id = "zulu-poker-settings-btn";
-        btn.textContent = "Z";
-        Object.assign(btn.style, {
-            position: "fixed",
-            right: "10px",
-            bottom: "10px",
-            width: "34px",
-            height: "34px",
-            borderRadius: "999px",
-            border: "1px solid rgba(255,255,255,0.18)",
-            background: "rgba(0,0,0,0.88)",
-            color: "#fff",
-            zIndex: "999999",
-            fontWeight: "700",
-            fontSize: "14px",
-            cursor: "pointer",
-            boxShadow: "0 6px 18px rgba(0,0,0,0.35)"
-        });
-
-        const badge = document.createElement("div");
-        badge.id = "zulu-poker-settings-badge";
-        Object.assign(badge.style, {
-            position: "fixed",
-            right: "46px",
-            bottom: "16px",
-            background: "rgba(0,0,0,0.88)",
-            color: "#c8f7ff",
-            padding: "4px 8px",
-            borderRadius: "999px",
-            fontFamily: "monospace",
-            fontSize: "11px",
-            zIndex: "999999",
-            border: "1px solid rgba(255,255,255,0.10)"
-        });
-        badge.textContent = statusLabel();
-
-        const modal = document.createElement("div");
-        modal.id = "zulu-poker-settings-modal";
-        Object.assign(modal.style, {
-            display: "none",
-            position: "fixed",
-            zIndex: "1000000",
-            inset: "0",
-            background: "rgba(0,0,0,0.55)"
-        });
-
-        const panel = document.createElement("div");
-        Object.assign(panel.style, {
-            position: "absolute",
-            right: "10px",
-            bottom: "54px",
-            width: "min(380px, calc(100vw - 20px))",
-            background: "#101726",
-            color: "#fff",
-            borderRadius: "14px",
-            border: "1px solid rgba(255,255,255,0.10)",
-            padding: "14px",
-            fontFamily: "system-ui, sans-serif",
-            boxShadow: "0 14px 34px rgba(0,0,0,0.45)"
-        });
-
-        panel.innerHTML = `
-            <div style="font-size:16px;font-weight:700;margin-bottom:8px;">Zulu Poker Tracker</div>
-            <div style="font-size:12px;opacity:0.8;margin-bottom:10px;">
-                Status: <span id="zulu-settings-status">${statusLabel()}</span><br>
-                Owner ID: <span id="zulu-settings-owner">${STATE.ownerTornId || "-"}</span>
-            </div>
-
-            <a href="https://www.torn.com/preferences.php#tab=api?step=addNewKey&title=ZuluPokerPublic&user=basic"
-               target="_blank"
-               style="display:inline-block;margin-bottom:10px;color:#9fd4ff;">
-               Crea una custom key Torn
-            </a>
-
-            <label style="display:block;font-size:12px;opacity:0.8;margin-bottom:6px;">Custom Key Torn</label>
-            <input id="zulu-settings-key" type="password" placeholder="Incolla la tua custom key"
-                style="width:100%;padding:10px;border-radius:10px;border:none;background:#1a2336;color:#fff;margin-bottom:10px;">
-
-            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">
-                <button id="zulu-test-key-btn" style="padding:10px 12px;border:none;border-radius:10px;background:#335eea;color:#fff;font-weight:700;cursor:pointer;">Test Key</button>
-                <button id="zulu-authorize-btn" style="padding:10px 12px;border:none;border-radius:10px;background:#14b86f;color:#fff;font-weight:700;cursor:pointer;">Authorize</button>
-                <button id="zulu-clear-key-btn" style="padding:10px 12px;border:none;border-radius:10px;background:#9b2c2c;color:#fff;font-weight:700;cursor:pointer;">Clear</button>
-            </div>
-
-            <div id="zulu-settings-message" style="font-size:12px;white-space:pre-wrap;opacity:0.9;">Ready</div>
-        `;
-
-        modal.appendChild(panel);
-        document.body.appendChild(modal);
-        document.body.appendChild(badge);
-        document.body.appendChild(btn);
-
-        const input = panel.querySelector("#zulu-settings-key");
-        const msg = panel.querySelector("#zulu-settings-message");
-        const ownerEl = panel.querySelector("#zulu-settings-owner");
-        const statusEl = panel.querySelector("#zulu-settings-status");
-
-        input.value = STATE.tornKey || "";
-
-        function refreshPanelStatus(text) {
-            badge.textContent = statusLabel();
-            statusEl.textContent = statusLabel();
-            ownerEl.textContent = STATE.ownerTornId || "-";
-            if (text) msg.textContent = text;
+    function ensurePlayerStats(userId, name) {
+        const id = String(userId);
+        if (!PLAYER_STATS[id]) {
+            PLAYER_STATS[id] = {
+                name: name || ("ID " + id),
+                hands: 0,
+                vpipHands: 0,
+                pfrHands: 0,
+                persistedLoaded: false
+            };
+        } else if (name) {
+            PLAYER_STATS[id].name = name;
         }
-
-        btn.addEventListener("click", () => {
-            modal.style.display = modal.style.display === "none" ? "block" : "none";
-            refreshPanelStatus();
-        });
-
-        modal.addEventListener("click", (e) => {
-            if (e.target === modal) modal.style.display = "none";
-        });
-
-        panel.querySelector("#zulu-test-key-btn").addEventListener("click", () => {
-            const key = input.value.trim();
-            if (!key) {
-                refreshPanelStatus("Inserisci una custom key Torn.");
-                return;
-            }
-            testTornKey(key, function (ok, dataOrMsg) {
-                if (!ok) {
-                    refreshPanelStatus("Test key fallito:\n" + dataOrMsg);
-                    return;
-                }
-                STATE.tornKey = key;
-                STATE.ownerTornId = dataOrMsg.player_id;
-                STATE.ownerName = dataOrMsg.name || null;
-                setLS(LS.tornKey, key);
-                setLS(LS.ownerId, STATE.ownerTornId);
-                setLS(LS.ownerName, STATE.ownerName || "");
-                refreshPanelStatus("Key valida.\nOwner ID: " + STATE.ownerTornId + "\nName: " + (STATE.ownerName || "-"));
-            });
-        });
-
-        panel.querySelector("#zulu-authorize-btn").addEventListener("click", () => {
-            const key = input.value.trim();
-            if (!key) {
-                refreshPanelStatus("Inserisci una custom key Torn.");
-                return;
-            }
-
-            testTornKey(key, function (ok, dataOrMsg) {
-                if (!ok) {
-                    refreshPanelStatus("Test key fallito:\n" + dataOrMsg);
-                    return;
-                }
-
-                STATE.tornKey = key;
-                STATE.ownerTornId = dataOrMsg.player_id;
-                STATE.ownerName = dataOrMsg.name || null;
-                setLS(LS.tornKey, key);
-                setLS(LS.ownerId, STATE.ownerTornId);
-                setLS(LS.ownerName, STATE.ownerName || "");
-
-                bootstrapPublic(function (enabled, info) {
-                    refreshPanelStatus(info || (enabled ? "Authorized" : "Blocked"));
-                });
-            });
-        });
-
-        panel.querySelector("#zulu-clear-key-btn").addEventListener("click", () => {
-            input.value = "";
-            STATE.tornKey = null;
-            STATE.ownerTornId = null;
-            STATE.ownerName = null;
-            STATE.publicToken = null;
-            STATE.authorized = false;
-            STATE.sniffingEnabled = false;
-            delLS(LS.tornKey);
-            delLS(LS.ownerId);
-            delLS(LS.ownerName);
-            delLS(LS.publicToken);
-            delLS(LS.publicEnabled);
-            refreshPanelStatus("Key rimossa.");
-            removePlayerHUDs();
-        });
-
-        refreshPanelStatus();
+        return PLAYER_STATS[id];
     }
 
-    // --------------------------------------------------
-    // key + bootstrap
-    // --------------------------------------------------
+    function ensureTable(tableId) {
+        const key = String(tableId);
+        if (!STATE.tables[key]) {
+            STATE.tables[key] = {
+                id: key,
+                playersById: {},
+                nameToId: {},
+                currentHandId: null,
+                lastHandId: null,
+                street: "preflop",
+                handTracker: {
+                    active: false,
+                    vpip: {},
+                    pfr: {},
+                    participants: {}
+                }
+            };
+        }
+        return STATE.tables[key];
+    }
 
     function loadPersistedState() {
         STATE.tornKey = getLS(LS.tornKey, "") || null;
@@ -351,6 +182,13 @@
         STATE.publicToken = getLS(LS.publicToken, "") || null;
         STATE.authorized = getLS(LS.publicEnabled, "false") === "true";
         STATE.sniffingEnabled = STATE.authorized && !!STATE.publicToken;
+    }
+
+    function currentStatusLabel() {
+        if (!STATE.tornKey) return "NO KEY";
+        if (!STATE.ownerTornId) return "NO ID";
+        if (!STATE.authorized) return "BLOCKED";
+        return "ON";
     }
 
     function testTornKey(key, cb) {
@@ -391,83 +229,258 @@
             return;
         }
 
-        reqServer("POST", "/api/public/bootstrap", {
-            owner_torn_id: STATE.ownerTornId,
-            script_version: SCRIPT_VERSION
-        }, function (err, res) {
-            if (err || !res) {
-                STATE.authorized = false;
-                STATE.publicToken = null;
-                STATE.sniffingEnabled = false;
-                delLS(LS.publicToken);
-                setLS(LS.publicEnabled, "false");
-                cb(false, "bootstrap request failed");
-                return;
-            }
-
-            const data = safeParse(res.text, {});
-            if (res.status !== 200 || !data || !data.ok || !data.enabled || !data.session_token) {
-                STATE.authorized = false;
-                STATE.publicToken = null;
-                STATE.sniffingEnabled = false;
-                delLS(LS.publicToken);
-                setLS(LS.publicEnabled, "false");
-                cb(false, "non autorizzato");
-                return;
-            }
-
-            STATE.authorized = true;
-            STATE.publicToken = String(data.session_token);
-            STATE.sniffingEnabled = true;
-
-            setLS(LS.publicToken, STATE.publicToken);
-            setLS(LS.publicEnabled, "true");
-            setLS(LS.lastBootstrapAt, Date.now());
-
-            ensureLoops();
-            startSession();
-            cb(true, "autorizzato");
-        }, false);
-    }
-
-    // --------------------------------------------------
-    // poker data model
-    // --------------------------------------------------
-
-    function ensureTable(tableId) {
-        const key = String(tableId);
-        if (!STATE.tables[key]) {
-            STATE.tables[key] = {
-                id: key,
-                playersById: {},
-                nameToId: {},
-                currentHandId: null,
-                lastHandId: null,
-                street: "preflop",
-                handTracker: {
-                    active: false,
-                    vpip: {},
-                    pfr: {},
-                    participants: {}
+        reqServer(
+            "POST",
+            "/api/public/bootstrap",
+            {
+                owner_torn_id: STATE.ownerTornId,
+                script_version: SCRIPT_VERSION
+            },
+            function (err, res) {
+                if (err || !res) {
+                    STATE.authorized = false;
+                    STATE.publicToken = null;
+                    STATE.sniffingEnabled = false;
+                    delLS(LS.publicToken);
+                    setLS(LS.publicEnabled, "false");
+                    cb(false, "bootstrap request failed");
+                    return;
                 }
-            };
-        }
-        return STATE.tables[key];
+
+                const data = safeParse(res.text, {});
+                if (res.status !== 200 || !data || !data.ok || !data.enabled || !data.session_token) {
+                    STATE.authorized = false;
+                    STATE.publicToken = null;
+                    STATE.sniffingEnabled = false;
+                    delLS(LS.publicToken);
+                    setLS(LS.publicEnabled, "false");
+                    cb(false, "not authorized");
+                    return;
+                }
+
+                STATE.authorized = true;
+                STATE.publicToken = String(data.session_token);
+                STATE.sniffingEnabled = true;
+
+                setLS(LS.publicToken, STATE.publicToken);
+                setLS(LS.publicEnabled, "true");
+
+                ensureLoops();
+                startSession();
+                fetchPersistedStatsForActiveTable();
+
+                cb(true, "authorized");
+            },
+            false
+        );
     }
 
-    function ensurePlayerStats(userId, name) {
-        const id = String(userId);
-        if (!PLAYER_STATS[id]) {
-            PLAYER_STATS[id] = {
-                name: name || ("ID " + id),
-                hands: 0,
-                vpipHands: 0,
-                pfrHands: 0
-            };
-        } else if (name) {
-            PLAYER_STATS[id].name = name;
+    function mountSettingsUI() {
+        if (STATE.settingsMounted || !document.body) return;
+        STATE.settingsMounted = true;
+
+        const btn = document.createElement("button");
+        btn.id = "atpu-settings-btn";
+        btn.textContent = "A";
+        Object.assign(btn.style, {
+            position: "fixed",
+            right: "10px",
+            bottom: "10px",
+            width: "34px",
+            height: "34px",
+            borderRadius: "999px",
+            border: "1px solid rgba(255,255,255,0.18)",
+            background: "rgba(0,0,0,0.88)",
+            color: "#fff",
+            zIndex: "999999",
+            fontWeight: "700",
+            fontSize: "14px",
+            cursor: "pointer",
+            boxShadow: "0 6px 18px rgba(0,0,0,0.35)"
+        });
+
+        const badge = document.createElement("div");
+        badge.id = "atpu-settings-badge";
+        Object.assign(badge.style, {
+            position: "fixed",
+            right: "46px",
+            bottom: "16px",
+            background: "rgba(0,0,0,0.88)",
+            color: "#c8f7ff",
+            padding: "4px 8px",
+            borderRadius: "999px",
+            fontFamily: "monospace",
+            fontSize: "11px",
+            zIndex: "999999",
+            border: "1px solid rgba(255,255,255,0.10)"
+        });
+        badge.textContent = currentStatusLabel();
+
+        const modal = document.createElement("div");
+        modal.id = "atpu-settings-modal";
+        Object.assign(modal.style, {
+            display: "none",
+            position: "fixed",
+            zIndex: "1000000",
+            inset: "0",
+            background: "rgba(0,0,0,0.55)"
+        });
+
+        const panel = document.createElement("div");
+        Object.assign(panel.style, {
+            position: "absolute",
+            right: "10px",
+            bottom: "54px",
+            width: "min(380px, calc(100vw - 20px))",
+            background: "#101726",
+            color: "#fff",
+            borderRadius: "14px",
+            border: "1px solid rgba(255,255,255,0.10)",
+            padding: "14px",
+            fontFamily: "system-ui, sans-serif",
+            boxShadow: "0 14px 34px rgba(0,0,0,0.45)"
+        });
+
+        panel.innerHTML = `
+            <div style="font-size:16px;font-weight:700;margin-bottom:8px;">ATornPokerUtility</div>
+            <div style="font-size:12px;opacity:0.8;margin-bottom:10px;">
+                Status: <span id="atpu-settings-status">${currentStatusLabel()}</span><br>
+                Owner ID: <span id="atpu-settings-owner">${STATE.ownerTornId || "-"}</span><br>
+                Last Flush: <span id="atpu-settings-flush">${STATE.lastFlush}</span>
+            </div>
+
+            <a href="https://www.torn.com/preferences.php#tab=api?step=addNewKey&title=ATornPokerUtility&user=basic"
+               target="_blank"
+               style="display:inline-block;margin-bottom:10px;color:#9fd4ff;">
+               Create a Torn custom key
+            </a>
+
+            <label style="display:block;font-size:12px;opacity:0.8;margin-bottom:6px;">Custom Torn Key</label>
+            <input id="atpu-settings-key" type="password" placeholder="Paste your Torn custom key"
+                style="width:100%;padding:10px;border-radius:10px;border:none;background:#1a2336;color:#fff;margin-bottom:10px;">
+
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">
+                <button id="atpu-test-key-btn" style="padding:10px 12px;border:none;border-radius:10px;background:#335eea;color:#fff;font-weight:700;cursor:pointer;">Test Key</button>
+                <button id="atpu-authorize-btn" style="padding:10px 12px;border:none;border-radius:10px;background:#14b86f;color:#fff;font-weight:700;cursor:pointer;">Authorize</button>
+                <button id="atpu-clear-key-btn" style="padding:10px 12px;border:none;border-radius:10px;background:#9b2c2c;color:#fff;font-weight:700;cursor:pointer;">Clear</button>
+            </div>
+
+            <div id="atpu-settings-message" style="font-size:12px;white-space:pre-wrap;opacity:0.9;">Ready</div>
+        `;
+
+        modal.appendChild(panel);
+        document.body.appendChild(modal);
+        document.body.appendChild(badge);
+        document.body.appendChild(btn);
+
+        const input = panel.querySelector("#atpu-settings-key");
+        const msg = panel.querySelector("#atpu-settings-message");
+        const ownerEl = panel.querySelector("#atpu-settings-owner");
+        const statusEl = panel.querySelector("#atpu-settings-status");
+        const flushEl = panel.querySelector("#atpu-settings-flush");
+
+        input.value = STATE.tornKey || "";
+
+        function refreshPanelStatus(text) {
+            badge.textContent = currentStatusLabel();
+            statusEl.textContent = currentStatusLabel();
+            ownerEl.textContent = STATE.ownerTornId || "-";
+            flushEl.textContent = STATE.lastFlush;
+            if (text) msg.textContent = text;
         }
-        return PLAYER_STATS[id];
+
+        btn.addEventListener("click", () => {
+            modal.style.display = modal.style.display === "none" ? "block" : "none";
+            refreshPanelStatus();
+        });
+
+        modal.addEventListener("click", (e) => {
+            if (e.target === modal) modal.style.display = "none";
+        });
+
+        panel.querySelector("#atpu-test-key-btn").addEventListener("click", () => {
+            const key = input.value.trim();
+            if (!key) {
+                refreshPanelStatus("Insert a Torn custom key.");
+                return;
+            }
+
+            testTornKey(key, function (ok, dataOrMsg) {
+                if (!ok) {
+                    refreshPanelStatus("Key test failed:\n" + dataOrMsg);
+                    return;
+                }
+
+                STATE.tornKey = key;
+                STATE.ownerTornId = dataOrMsg.player_id;
+                STATE.ownerName = dataOrMsg.name || null;
+
+                setLS(LS.tornKey, key);
+                setLS(LS.ownerId, STATE.ownerTornId);
+                setLS(LS.ownerName, STATE.ownerName || "");
+
+                refreshPanelStatus(
+                    "Key valid.\nOwner ID: " +
+                    STATE.ownerTornId +
+                    "\nName: " +
+                    (STATE.ownerName || "-")
+                );
+            });
+        });
+
+        panel.querySelector("#atpu-authorize-btn").addEventListener("click", () => {
+            const key = input.value.trim();
+            if (!key) {
+                refreshPanelStatus("Insert a Torn custom key.");
+                return;
+            }
+
+            testTornKey(key, function (ok, dataOrMsg) {
+                if (!ok) {
+                    refreshPanelStatus("Key test failed:\n" + dataOrMsg);
+                    return;
+                }
+
+                STATE.tornKey = key;
+                STATE.ownerTornId = dataOrMsg.player_id;
+                STATE.ownerName = dataOrMsg.name || null;
+
+                setLS(LS.tornKey, key);
+                setLS(LS.ownerId, STATE.ownerTornId);
+                setLS(LS.ownerName, STATE.ownerName || "");
+
+                bootstrapPublic(function (enabled, info) {
+                    refreshPanelStatus(info || (enabled ? "Authorized" : "Blocked"));
+                });
+            });
+        });
+
+        panel.querySelector("#atpu-clear-key-btn").addEventListener("click", () => {
+            input.value = "";
+            STATE.tornKey = null;
+            STATE.ownerTornId = null;
+            STATE.ownerName = null;
+            STATE.publicToken = null;
+            STATE.authorized = false;
+            STATE.sniffingEnabled = false;
+            STATE.sessionId = null;
+            STATE.sessionStarted = false;
+
+            delLS(LS.tornKey);
+            delLS(LS.ownerId);
+            delLS(LS.ownerName);
+            delLS(LS.publicToken);
+            delLS(LS.publicEnabled);
+
+            refreshPanelStatus("Key removed.");
+            removePlayerHUDs();
+        });
+
+        setInterval(() => {
+            if (modal.style.display !== "none") refreshPanelStatus();
+        }, 1500);
+
+        refreshPanelStatus();
     }
 
     function normalizePlayers(table, playersObj) {
@@ -478,7 +491,7 @@
             if (!p || !p.userID) return;
 
             const uid = String(p.userID);
-            const name = p.playername || p.name || ("ID " + uid);
+            const name = normalizeName(p.playername || p.name || ("ID " + uid));
             const stack = p.money != null ? parseMoney(p.money) : null;
             const status = p.status || null;
 
@@ -507,7 +520,9 @@
             s.includes("thinking") ||
             s.includes("dealer") ||
             s.includes("active")
-        ) return null;
+        ) {
+            return null;
+        }
 
         if (s.includes("fold")) return "fold";
         if (s.includes("check")) return "check";
@@ -560,7 +575,9 @@
             finalizePreviousHand(table);
             table.lastHandId = current;
             startNewHand(table);
-            Object.keys(LAST_ACTION).forEach(key => delete LAST_ACTION[key]);
+
+            Object.keys(LAST_ACTION_DEDUPE).forEach(key => delete LAST_ACTION_DEDUPE[key]);
+            fetchPersistedStatsForActiveTable();
         }
     }
 
@@ -588,6 +605,7 @@
             player_name: ev.player_name ?? null,
             amount: ev.amount ?? null,
             stack_before: ev.stack_before ?? null,
+            stack_after: ev.stack_after ?? null,
             hand_id: ev.hand_id ?? null,
             timestamp: Date.now(),
             metadata: {
@@ -596,6 +614,53 @@
         });
 
         STATE.lastAction = ev.type + " " + (ev.player_name || "");
+    }
+
+    function detectRosterChanges(tableId, newPlayers, oldPlayers, currentHandId) {
+        const newIds = new Set(Object.keys(newPlayers));
+        const oldIds = new Set(Object.keys(oldPlayers));
+
+        for (const id of newIds) {
+            if (!oldIds.has(id)) {
+                const p = newPlayers[id];
+                queueEvent(tableId, {
+                    type: "join",
+                    player_id: Number(p.id),
+                    player_name: p.name,
+                    stack_after: p.stack,
+                    hand_id: currentHandId
+                });
+            }
+        }
+
+        for (const id of oldIds) {
+            if (!newIds.has(id)) {
+                const p = oldPlayers[id];
+                queueEvent(tableId, {
+                    type: "leave",
+                    player_id: Number(p.id),
+                    player_name: p.name,
+                    stack_before: p.stack,
+                    hand_id: currentHandId
+                });
+            }
+        }
+
+        for (const id of newIds) {
+            if (!oldIds.has(id)) continue;
+            const prev = oldPlayers[id];
+            const curr = newPlayers[id];
+            if (prev && curr && prev.stack !== curr.stack) {
+                queueEvent(tableId, {
+                    type: "stack_update",
+                    player_id: Number(curr.id),
+                    player_name: curr.name,
+                    stack_before: prev.stack,
+                    stack_after: curr.stack,
+                    hand_id: currentHandId
+                });
+            }
+        }
     }
 
     function detectActions(tableId, table, oldPlayers, msg) {
@@ -611,8 +676,8 @@
             if (!type) return;
 
             const dedupeKey = `${p.id}_${type}_${table.currentHandId || "nohand"}`;
-            if (LAST_ACTION[dedupeKey]) return;
-            LAST_ACTION[dedupeKey] = true;
+            if (LAST_ACTION_DEDUPE[dedupeKey]) return;
+            LAST_ACTION_DEDUPE[dedupeKey] = true;
 
             markPreflopAction(table, p.id, type);
 
@@ -622,6 +687,7 @@
                 player_name: p.name,
                 amount: msg.amountCall || null,
                 stack_before: prev.stack,
+                stack_after: p.stack,
                 hand_id: table.currentHandId
             });
         });
@@ -629,7 +695,11 @@
 
     function updatePlayersFromState(tableId, msg) {
         const table = ensureTable(tableId);
-        STATE.activeTableId = String(tableId);
+
+        if (STATE.activeTableId !== String(tableId)) {
+            STATE.activeTableId = String(tableId);
+            fetchPersistedStatsForActiveTable();
+        }
 
         const oldPlayers = {};
         Object.entries(table.playersById).forEach(([k, v]) => {
@@ -647,20 +717,25 @@
         const token = msg.token || msg.gameToken || msg.handId || msg.hand_id || null;
         if (token) table.currentHandId = String(token);
 
+        detectRosterChanges(tableId, table.playersById, oldPlayers, table.currentHandId);
         maybeRotateHand(table);
         detectActions(tableId, table, oldPlayers, msg);
     }
 
     function updateFromUpdatePlayer(tableId, msg) {
         const table = ensureTable(tableId);
-        STATE.activeTableId = String(tableId);
 
-        const playersObj = msg.player || msg.players || {};
+        if (STATE.activeTableId !== String(tableId)) {
+            STATE.activeTableId = String(tableId);
+            fetchPersistedStatsForActiveTable();
+        }
+
         const oldPlayers = {};
         Object.entries(table.playersById).forEach(([k, v]) => {
             oldPlayers[k] = { ...v };
         });
 
+        const playersObj = msg.player || msg.players || {};
         if (msg.phase) {
             const ph = String(msg.phase).toLowerCase();
             if (ph.includes("pre")) table.street = "preflop";
@@ -674,7 +749,7 @@
                 if (!p || !p.userID) return;
 
                 const uid = String(p.userID);
-                const name = p.playername || p.name || ("ID " + uid);
+                const name = normalizeName(p.playername || p.name || ("ID " + uid));
                 const stack = p.money != null ? parseMoney(p.money) : null;
                 const status = p.status || null;
 
@@ -691,15 +766,12 @@
             });
         }
 
+        detectRosterChanges(tableId, table.playersById, oldPlayers, table.currentHandId);
         maybeRotateHand(table);
         detectActions(tableId, table, oldPlayers, msg);
     }
 
-    // --------------------------------------------------
-    // ws sniffing
-    // --------------------------------------------------
-
-    function handleHoldem(raw) {
+    function handleHoldemMessage(raw) {
         if (!STATE.sniffingEnabled) return;
 
         const push = raw?.push;
@@ -713,8 +785,6 @@
         if (!m) return;
 
         const tableId = m[1];
-        STATE.activeTableId = String(tableId);
-
         const eventType = msg.eventType || null;
 
         if (eventType === "getState" || eventType === "playerMakeMove") {
@@ -727,12 +797,6 @@
         }
     }
 
-    function handleLobby(raw) {
-        if (!STATE.sniffingEnabled) return;
-        const msg = raw?.push?.pub?.data?.message;
-        if (!msg || !msg.tables) return;
-    }
-
     function installWSHook() {
         if (STATE.wsInstalled) return;
         STATE.wsInstalled = true;
@@ -743,22 +807,22 @@
         function WrappedWebSocket(url, protocols) {
             const ws = protocols ? new OriginalWebSocket(url, protocols) : new OriginalWebSocket(url);
 
-            ws.addEventListener("message", ev => {
+            ws.addEventListener("message", function (ev) {
                 if (!STATE.sniffingEnabled) return;
-
-                const data = ev.data;
-                if (typeof data !== "string") return;
+                if (typeof ev.data !== "string") return;
 
                 let parsed;
-                try { parsed = JSON.parse(data); } catch { return; }
+                try {
+                    parsed = JSON.parse(ev.data);
+                } catch {
+                    return;
+                }
 
                 const channel = parsed?.push?.channel;
                 if (!channel) return;
 
-                if (channel === "holdemlobby") {
-                    handleLobby(parsed);
-                } else if (/^holdem\d+$/.test(channel)) {
-                    handleHoldem(parsed);
+                if (/^holdem\d+$/.test(channel)) {
+                    handleHoldemMessage(parsed);
                 }
             });
 
@@ -769,32 +833,35 @@
         globalWindow.WebSocket = WrappedWebSocket;
     }
 
-    // --------------------------------------------------
-    // session + sending
-    // --------------------------------------------------
-
     function startSession() {
         if (!STATE.sniffingEnabled || !STATE.publicToken) return;
         if (STATE.sessionStarted) return;
+
         STATE.sessionStarted = true;
 
-        reqServer("POST", "/api/public/sessions/start", {
-            table_id: location.href,
-            stack_start: null
-        }, function (err, res) {
-            if (err || !res || res.status !== 200) {
-                STATE.sessionStarted = false;
-                return;
-            }
+        reqServer(
+            "POST",
+            "/api/public/sessions/start",
+            {
+                table_id: location.href,
+                stack_start: null
+            },
+            function (err, res) {
+                if (err || !res || res.status !== 200) {
+                    STATE.sessionStarted = false;
+                    return;
+                }
 
-            const data = safeParse(res.text, {});
-            if (!data || !data.session_id) {
-                STATE.sessionStarted = false;
-                return;
-            }
+                const data = safeParse(res.text, {});
+                if (!data || !data.session_id) {
+                    STATE.sessionStarted = false;
+                    return;
+                }
 
-            STATE.sessionId = String(data.session_id);
-        }, true);
+                STATE.sessionId = String(data.session_id);
+            },
+            true
+        );
     }
 
     function flushEvents() {
@@ -804,17 +871,60 @@
 
         const batch = STATE.eventQueue.splice(0, 50);
 
-        reqServer("POST", "/api/public/events", {
-            session_id: STATE.sessionId,
-            events: batch
-        }, function (err, res) {
-            if (err || !res || res.status !== 200) {
-                STATE.eventQueue = batch.concat(STATE.eventQueue);
-                STATE.lastFlush = "failed";
-                return;
-            }
-            STATE.lastFlush = "ok " + batch.length;
-        }, true);
+        reqServer(
+            "POST",
+            "/api/public/events",
+            {
+                session_id: STATE.sessionId,
+                events: batch
+            },
+            function (err, res) {
+                if (err || !res || res.status !== 200) {
+                    STATE.eventQueue = batch.concat(STATE.eventQueue);
+                    STATE.lastFlush = "failed";
+                    return;
+                }
+
+                STATE.lastFlush = "ok " + batch.length;
+            },
+            true
+        );
+    }
+
+    function fetchPersistedStatsForActiveTable() {
+        if (!STATE.sniffingEnabled || !STATE.publicToken) return;
+        if (!STATE.activeTableId) return;
+
+        const now = Date.now();
+        if (now - STATE.lastPersistFetchAt < 2500) return;
+        STATE.lastPersistFetchAt = now;
+
+        reqServer(
+            "GET",
+            "/api/public/stats/table?table_id=" + encodeURIComponent(STATE.activeTableId),
+            null,
+            function (err, res) {
+                if (err || !res || res.status !== 200) return;
+
+                const data = safeParse(res.text, {});
+                const stats = Array.isArray(data?.stats) ? data.stats : [];
+
+                stats.forEach(s => {
+                    const id = String(s.player_id);
+                    const ps = ensurePlayerStats(id, s.player_name || ("ID " + id));
+
+                    const hands = Number(s.hands || 0);
+                    const vpip = Number(s.vpip || 0);
+                    const pfr = Number(s.pfr || 0);
+
+                    ps.hands = Math.max(ps.hands || 0, hands);
+                    ps.vpipHands = Math.max(ps.vpipHands || 0, Math.round(hands * vpip / 100));
+                    ps.pfrHands = Math.max(ps.pfrHands || 0, Math.round(hands * pfr / 100));
+                    ps.persistedLoaded = true;
+                });
+            },
+            true
+        );
     }
 
     function ensureLoops() {
@@ -825,13 +935,14 @@
 
         if (!STATE.playerHudLoopStarted) {
             STATE.playerHudLoopStarted = true;
-            setInterval(renderPlayerHUD, 900);
+            setInterval(renderPlayerHUDs, 900);
+        }
+
+        if (!STATE.persistedFetchLoopStarted) {
+            STATE.persistedFetchLoopStarted = true;
+            setInterval(fetchPersistedStatsForActiveTable, 5000);
         }
     }
-
-    // --------------------------------------------------
-    // inline player HUD
-    // --------------------------------------------------
 
     function getPlayerStyle(vpip, pfr, hands) {
         if (!hands || hands <= 0) return { label: "NEW", color: "#9ca3af" };
@@ -843,10 +954,10 @@
     }
 
     function removePlayerHUDs() {
-        document.querySelectorAll(".zulu-player-hud").forEach(el => el.remove());
+        document.querySelectorAll(".atpu-player-hud").forEach(el => el.remove());
     }
 
-    function renderPlayerHUD() {
+    function renderPlayerHUDs() {
         if (!STATE.sniffingEnabled) {
             removePlayerHUDs();
             return;
@@ -856,17 +967,17 @@
         if (!boxes.length) return;
 
         boxes.forEach(box => {
-            const match = box.id.match(/^player-(\d+)/);
+            const match = String(box.id || "").match(/^player-(\d+)/);
             if (!match) return;
 
             const userId = match[1];
             const stats = PLAYER_STATS[userId];
             if (!stats) return;
 
-            let hud = box.querySelector(".zulu-player-hud");
+            let hud = box.querySelector(".atpu-player-hud");
             if (!hud) {
                 hud = document.createElement("div");
-                hud.className = "zulu-player-hud";
+                hud.className = "atpu-player-hud";
 
                 Object.assign(hud.style, {
                     position: "absolute",
@@ -905,10 +1016,6 @@
         });
     }
 
-    // --------------------------------------------------
-    // boot
-    // --------------------------------------------------
-
     function boot() {
         if (STATE.started) return;
         STATE.started = true;
@@ -923,6 +1030,7 @@
                 STATE.sniffingEnabled = true;
                 ensureLoops();
                 startSession();
+                fetchPersistedStatsForActiveTable();
             }
         });
     }
