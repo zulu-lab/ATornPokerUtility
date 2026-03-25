@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ATornPokerUtility
 // @namespace    zulu.atornpoker.utility
-// @version      4.7.0
+// @version      4.7.1
 // @description  Torn Poker HUD with whitelist auth and server stats (PDA compatible)
 // @match        https://www.torn.com/page.php?sid=holdem*
 // @match        https://www.torn.com/pda.php?sid=holdem*
@@ -22,6 +22,7 @@ if (globalWindow.__A_TPU__) return;
 globalWindow.__A_TPU__ = true;
 
 const SERVER = "https://torn-poker-server-production.up.railway.app";
+const SCRIPT_VERSION = "4.7.1";
 const LS = { token: "atpu.publicToken", authorized: "atpu.authorized" };
 
 const STATE = {
@@ -33,7 +34,8 @@ const STATE = {
     authorized: false,
     publicToken: null,
     started: false,
-    lastFlush: "-"
+    lastFlush: "-",
+    lastRepairAttemptAt: 0
 };
 
 const PLAYER_STATS = {};
@@ -128,7 +130,7 @@ function bootstrap(ownerId) {
         "Content-Type": "application/json"
     }, {
         owner_torn_id: ownerId,
-        script_version: "4.7.0"
+        script_version: SCRIPT_VERSION
     }, (err, res) => {
         if (err || res.status !== 200) return;
 
@@ -138,6 +140,46 @@ function bootstrap(ownerId) {
         STATE.publicToken = data.session_token;
         STATE.authorized = true;
         saveAuthState();
+    });
+}
+
+function updateAuthStatus(message, color) {
+    const el = document.getElementById("atpu-auth-status");
+    if (!el) return;
+    el.textContent = message;
+    if (color) el.style.color = color;
+}
+
+function tryMaintenanceRepair(source) {
+    const now = Date.now();
+    if (source === "auto" && now - STATE.lastRepairAttemptAt < 60000) return;
+    STATE.lastRepairAttemptAt = now;
+
+    updateAuthStatus("Repair in progress…", "#fbbf24");
+
+    req("POST", SERVER + "/api/public/maintenance/repair", {
+        "Content-Type": "application/json",
+        "Authorization": STATE.publicToken ? ("Bearer " + STATE.publicToken) : ""
+    }, {
+        source: source || "manual",
+        script_version: SCRIPT_VERSION
+    }, (err, res) => {
+        if (err) {
+            updateAuthStatus("Repair failed (network).", "#f87171");
+            return;
+        }
+
+        if (res.status === 200) {
+            updateAuthStatus("Repair completed. Retry in a few seconds.", "#4ade80");
+            return;
+        }
+
+        if (res.status === 404) {
+            updateAuthStatus("Repair endpoint not enabled on server.", "#f87171");
+            return;
+        }
+
+        updateAuthStatus("Repair failed (" + res.status + ").", "#f87171");
     });
 }
 
@@ -152,6 +194,7 @@ function startSession() {
         STATE.sessionStarting = false;
         if (err || res.status !== 200) {
             if (res && res.status === 401) clearAuthState();
+            if (res && res.status >= 500) tryMaintenanceRepair("auto");
             return;
         }
 
@@ -173,6 +216,7 @@ function flush() {
             STATE.lastFlush = "failed";
             STATE.eventQueue = batch.concat(STATE.eventQueue);
             if (res && res.status === 401) clearAuthState();
+            if (res && res.status >= 500) tryMaintenanceRepair("auto");
             return;
         }
         STATE.lastFlush = "ok " + batch.length;
@@ -259,8 +303,6 @@ function getStyle(vpip, pfr, hands) {
 }
 
 function renderHUD() {
-    if (!STATE.authorized) return;
-
     document.querySelectorAll("[id^='player-']").forEach(box => {
         const id = box.id.replace("player-", "");
         const s = PLAYER_STATS[id];
@@ -444,11 +486,23 @@ function installWS() {
 
 function authorizeFromKey(key) {
     req("GET", `https://api.torn.com/user/?selections=basic&key=${encodeURIComponent(key)}`, {}, null, (err, res) => {
-        if (err || res.status !== 200) return alert("Invalid key");
+        if (err || res.status !== 200) {
+            updateAuthStatus("Authorization failed: invalid key.", "#f87171");
+            return alert("Invalid key");
+        }
 
         const data = safeParse(res.responseText, {});
-        if (!data.player_id) return alert("Unable to read player_id from Torn response");
+        if (!data.player_id) {
+            updateAuthStatus("Authorization failed: missing player_id.", "#f87171");
+            return alert("Unable to read player_id from Torn response");
+        }
         bootstrap(data.player_id);
+        setTimeout(() => {
+            updateAuthStatus(
+                STATE.authorized ? "Status: authorized" : "Status: not authorized",
+                STATE.authorized ? "#4ade80" : "#cbd5e1"
+            );
+        }, 700);
     });
 }
 
@@ -457,14 +511,14 @@ function mountButton() {
 
     const btn = document.createElement("button");
     btn.id = "atpu-auth-btn";
-    btn.textContent = "A";
+    btn.textContent = "AT";
 
     Object.assign(btn.style, {
         position: "fixed",
         left: "10px",
         bottom: "10px",
         zIndex: 999999,
-        width: "32px",
+        width: "38px",
         height: "32px",
         borderRadius: "50%",
         background: "#000",
@@ -498,13 +552,16 @@ function mountButton() {
 
     panel.innerHTML = `
         <div style="font-weight:700;margin-bottom:8px;">ATornPokerUtility</div>
+        <div id="atpu-auth-status" style="font-size:12px;opacity:0.9;margin-bottom:8px;color:#cbd5e1;">Status: not authorized</div>
         <a href="https://www.torn.com/preferences.php#tab=api?step=addNewKey&title=ATornPokerUtility&user=basic"
            target="_blank"
            style="display:inline-block;margin-bottom:8px;color:#9fd4ff;">Create custom API key (basic / owner id)</a>
         <input id="atpu-key-input" type="password" placeholder="Paste Torn custom API key"
                style="width:100%;padding:8px;border-radius:8px;border:none;background:#1a2336;color:#fff;margin-bottom:8px;">
-        <div style="display:flex;gap:8px;">
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
             <button id="atpu-auth-run" style="padding:8px 10px;border:none;border-radius:8px;background:#335eea;color:#fff;font-weight:700;">Authorize</button>
+            <button id="atpu-repair-run" style="padding:8px 10px;border:none;border-radius:8px;background:#7c3aed;color:#fff;font-weight:700;">Repair server</button>
+            <button id="atpu-auth-logout" style="padding:8px 10px;border:none;border-radius:8px;background:#b91c1c;color:#fff;">Logout</button>
             <button id="atpu-auth-close" style="padding:8px 10px;border:none;border-radius:8px;background:#444;color:#fff;">Close</button>
         </div>
     `;
@@ -517,8 +574,14 @@ function mountButton() {
     panel.querySelector("#atpu-auth-run").onclick = () => {
         const key = String(input.value || "").trim();
         if (!key) return;
+        updateAuthStatus("Authorizing…", "#fbbf24");
         authorizeFromKey(key);
         modal.style.display = "none";
+    };
+    panel.querySelector("#atpu-repair-run").onclick = () => tryMaintenanceRepair("manual");
+    panel.querySelector("#atpu-auth-logout").onclick = () => {
+        clearAuthState();
+        updateAuthStatus("Status: not authorized", "#cbd5e1");
     };
 
     panel.querySelector("#atpu-auth-close").onclick = () => {
@@ -530,6 +593,10 @@ function mountButton() {
     });
 
     btn.onclick = () => {
+        updateAuthStatus(
+            STATE.authorized ? "Status: authorized" : "Status: not authorized",
+            STATE.authorized ? "#4ade80" : "#cbd5e1"
+        );
         modal.style.display = modal.style.display === "none" ? "block" : "none";
     };
 }
