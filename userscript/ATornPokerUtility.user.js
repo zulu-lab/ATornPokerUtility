@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ATornPokerUtility
 // @namespace    zulu.atornpoker.utility
-// @version      4.7.1
+// @version      4.9.0
 // @description  Torn Poker HUD with whitelist auth and server stats (PDA compatible)
 // @match        https://www.torn.com/page.php?sid=holdem*
 // @match        https://www.torn.com/pda.php?sid=holdem*
@@ -12,6 +12,7 @@
 // @connect      torn-poker-server-production.up.railway.app
 // @connect      api.torn.com
 // @run-at       document-start
+// @license      UNLICENSED
 // ==/UserScript==
 
 (function () {
@@ -22,8 +23,14 @@ if (globalWindow.__A_TPU__) return;
 globalWindow.__A_TPU__ = true;
 
 const SERVER = "https://torn-poker-server-production.up.railway.app";
-const SCRIPT_VERSION = "4.7.1";
-const LS = { token: "atpu.publicToken", authorized: "atpu.authorized" };
+const SCRIPT_VERSION = "4.9.0";
+
+const LS = {
+    token: "atpu.publicToken",
+    authorized: "atpu.authorized",
+    tornApiKey: "atpu.tornApiKey",
+    hudVisible: "atpu.hudVisible"
+};
 
 const STATE = {
     sessionId: null,
@@ -35,7 +42,8 @@ const STATE = {
     publicToken: null,
     started: false,
     lastFlush: "-",
-    lastRepairAttemptAt: 0
+    authCheckedAt: 0,
+    hudVisible: true
 };
 
 const PLAYER_STATS = {};
@@ -85,10 +93,40 @@ function clearAuthState() {
     STATE.publicToken = null;
     STATE.sessionId = null;
     STATE.sessionStarting = false;
+    STATE.eventQueue = [];
     try {
         localStorage.removeItem(LS.token);
         localStorage.setItem(LS.authorized, "false");
     } catch {}
+}
+
+function saveLocalApiKey(key) {
+    try {
+        localStorage.setItem(LS.tornApiKey, key || "");
+    } catch {}
+}
+
+function loadLocalApiKey() {
+    try {
+        return localStorage.getItem(LS.tornApiKey) || "";
+    } catch {
+        return "";
+    }
+}
+
+function saveHudVisible(value) {
+    STATE.hudVisible = !!value;
+    try {
+        localStorage.setItem(LS.hudVisible, STATE.hudVisible ? "true" : "false");
+    } catch {}
+}
+
+function loadHudVisible() {
+    try {
+        STATE.hudVisible = localStorage.getItem(LS.hudVisible) !== "false";
+    } catch {
+        STATE.hudVisible = true;
+    }
 }
 
 function ensureTable(tableId) {
@@ -125,6 +163,40 @@ function parseMoney(text) {
     return Number.isFinite(num) ? num : null;
 }
 
+function formatMoneyShort(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return "-";
+    if (n >= 1000000000) return (n / 1000000000).toFixed(2).replace(/\.00$/, "") + "B";
+    if (n >= 1000000) return (n / 1000000).toFixed(2).replace(/\.00$/, "") + "M";
+    if (n >= 1000) return (n / 1000).toFixed(1).replace(/\.0$/, "") + "K";
+    return String(Math.round(n));
+}
+
+function resetTableSession(newTableId) {
+    STATE.sessionId = null;
+    STATE.sessionStarting = false;
+    STATE.eventQueue = [];
+
+    Object.keys(LAST_ACTION).forEach(k => delete LAST_ACTION[k]);
+
+    STATE.activeTableId = String(newTableId);
+
+    renderMenuStatus();
+}
+
+function switchActiveTable(tableId) {
+    const nextId = String(tableId);
+    if (!STATE.activeTableId) {
+        STATE.activeTableId = nextId;
+        renderMenuStatus();
+        return;
+    }
+
+    if (STATE.activeTableId !== nextId) {
+        resetTableSession(nextId);
+    }
+}
+
 function bootstrap(ownerId) {
     req("POST", SERVER + "/api/public/bootstrap", {
         "Content-Type": "application/json"
@@ -132,14 +204,27 @@ function bootstrap(ownerId) {
         owner_torn_id: ownerId,
         script_version: SCRIPT_VERSION
     }, (err, res) => {
-        if (err || res.status !== 200) return;
+        if (err || res.status !== 200) {
+            updateAuthStatus("Authorization failed.", "#f87171");
+            return;
+        }
 
         const data = safeParse(res.responseText, {});
-        if (!data.session_token) return;
+        if (!data.session_token) {
+            updateAuthStatus("Authorization denied.", "#f87171");
+            return;
+        }
 
         STATE.publicToken = data.session_token;
         STATE.authorized = true;
         saveAuthState();
+        updateAuthStatus("Status: authorized", "#4ade80");
+
+        if (STATE.activeTableId && !STATE.sessionId) {
+            startSession();
+        }
+
+        renderMenuStatus();
     });
 }
 
@@ -150,56 +235,27 @@ function updateAuthStatus(message, color) {
     if (color) el.style.color = color;
 }
 
-function tryMaintenanceRepair(source) {
-    const now = Date.now();
-    if (source === "auto" && now - STATE.lastRepairAttemptAt < 60000) return;
-    STATE.lastRepairAttemptAt = now;
-
-    updateAuthStatus("Repair in progress…", "#fbbf24");
-
-    req("POST", SERVER + "/api/public/maintenance/repair", {
-        "Content-Type": "application/json",
-        "Authorization": STATE.publicToken ? ("Bearer " + STATE.publicToken) : ""
-    }, {
-        source: source || "manual",
-        script_version: SCRIPT_VERSION
-    }, (err, res) => {
-        if (err) {
-            updateAuthStatus("Repair failed (network).", "#f87171");
-            return;
-        }
-
-        if (res.status === 200) {
-            updateAuthStatus("Repair completed. Retry in a few seconds.", "#4ade80");
-            return;
-        }
-
-        if (res.status === 404) {
-            updateAuthStatus("Repair endpoint not enabled on server.", "#f87171");
-            return;
-        }
-
-        updateAuthStatus("Repair failed (" + res.status + ").", "#f87171");
-    });
-}
-
 function startSession() {
     if (!STATE.publicToken || !STATE.activeTableId || STATE.sessionId || STATE.sessionStarting) return;
+
     STATE.sessionStarting = true;
+    renderMenuStatus();
 
     api("/api/public/sessions/start", "POST", {
         table_id: String(STATE.activeTableId),
         source_url: location.href
     }, (err, res) => {
         STATE.sessionStarting = false;
+
         if (err || res.status !== 200) {
             if (res && res.status === 401) clearAuthState();
-            if (res && res.status >= 500) tryMaintenanceRepair("auto");
+            renderMenuStatus();
             return;
         }
 
         const data = safeParse(res.responseText, {});
         STATE.sessionId = data.session_id || null;
+        renderMenuStatus();
     });
 }
 
@@ -216,10 +272,12 @@ function flush() {
             STATE.lastFlush = "failed";
             STATE.eventQueue = batch.concat(STATE.eventQueue);
             if (res && res.status === 401) clearAuthState();
-            if (res && res.status >= 500) tryMaintenanceRepair("auto");
+            renderMenuStatus();
             return;
         }
+
         STATE.lastFlush = "ok " + batch.length;
+        renderMenuStatus();
     });
 }
 
@@ -229,6 +287,7 @@ function loadStatsFromServer() {
     api(`/api/public/stats/table?table_id=${encodeURIComponent(String(STATE.activeTableId))}`, "GET", null, (err, res) => {
         if (err || res.status !== 200) {
             if (res && res.status === 401) clearAuthState();
+            renderMenuStatus();
             return;
         }
 
@@ -250,6 +309,7 @@ function loadStatsFromServer() {
         });
 
         renderHUD();
+        renderMenuStatus();
     });
 }
 
@@ -276,6 +336,7 @@ function mapStatusToType(status) {
 
 function queue(tableId, ev) {
     if (!STATE.authorized) return;
+    if (String(tableId) !== String(STATE.activeTableId)) return;
 
     STATE.eventQueue.push({
         table_id: String(tableId),
@@ -285,12 +346,14 @@ function queue(tableId, ev) {
         amount: ev.amount || null,
         stack_before: ev.stack_before || null,
         stack_after: ev.stack_after || null,
-        hand_id: null,
+        hand_id: ev.hand_id || null,
         event_ts: Date.now(),
         metadata: {
             raw_hand_ref: ev.hand_id || null
         }
     });
+
+    renderMenuStatus();
 }
 
 function getStyle(vpip, pfr, hands) {
@@ -308,6 +371,10 @@ function renderHUD() {
         const s = PLAYER_STATS[id];
         if (!s) return;
 
+        const currentTable = STATE.tables[String(STATE.activeTableId || "")];
+        const livePlayer = currentTable?.playersById?.[id] || null;
+        const liveStack = livePlayer?.stack ?? null;
+
         let hud = box.querySelector(".atpu-hud");
         if (!hud) {
             hud = document.createElement("div");
@@ -318,13 +385,18 @@ function renderHUD() {
                 top: "50%",
                 left: "50%",
                 transform: "translate(-50%, -50%)",
-                background: "rgba(0,0,0,0.9)",
+                background: "rgba(0,0,0,0.86)",
                 color: "#fff",
                 fontSize: "10px",
+                lineHeight: "1.12",
                 padding: "4px 6px",
-                borderRadius: "6px",
+                borderRadius: "8px",
                 zIndex: 9999,
-                pointerEvents: "none"
+                pointerEvents: "none",
+                textAlign: "center",
+                minWidth: "58px",
+                maxWidth: "76px",
+                border: "1px solid rgba(255,255,255,0.08)"
             });
 
             if (getComputedStyle(box).position === "static") {
@@ -334,15 +406,19 @@ function renderHUD() {
             box.appendChild(hud);
         }
 
+        hud.style.display = STATE.hudVisible ? "block" : "none";
+        if (!STATE.hudVisible) return;
+
         const vpip = s.hands ? (s.vpipHands / s.hands * 100) : 0;
         const pfr = s.hands ? (s.pfrHands / s.hands * 100) : 0;
         const st = getStyle(vpip, pfr, s.hands);
 
         hud.innerHTML =
-            `<div>${s.name}</div>` +
-            `<div style="color:${st.c}">${st.l}</div>` +
-            `<div>${vpip.toFixed(0)} / ${pfr.toFixed(0)}</div>` +
-            `<div>H:${s.hands}</div>`;
+            `<div style="font-weight:700;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${s.name}</div>` +
+            `<div style="color:${st.c};font-weight:700;margin-top:1px;">${st.l}</div>` +
+            `<div style="margin-top:1px;">${vpip.toFixed(0)} / ${pfr.toFixed(0)}</div>` +
+            `<div>H:${s.hands}</div>` +
+            `<div style="margin-top:1px;color:#d1d5db;">$${formatMoneyShort(liveStack)}</div>`;
     });
 }
 
@@ -358,7 +434,7 @@ function detectActions(tableId, table, oldPlayers, msg) {
         const type = mapStatusToType(newStatus);
         if (!type) return;
 
-        const dedupeKey = `${player.id}_${type}_${table.currentHandId || "nohand"}`;
+        const dedupeKey = `${tableId}_${player.id}_${type}_${table.currentHandId || "nohand"}`;
         if (LAST_ACTION[dedupeKey]) return;
         LAST_ACTION[dedupeKey] = true;
 
@@ -441,7 +517,7 @@ function handleHoldemMessage(parsed) {
     if (!m) return;
 
     const tableId = m[1];
-    STATE.activeTableId = tableId;
+    switchActiveTable(tableId);
 
     if (STATE.authorized && !STATE.sessionId) startSession();
     if (!STATE.authorized) return;
@@ -473,6 +549,7 @@ function installWS() {
 
                 const channel = parsed?.push?.channel;
                 if (!channel) return;
+
                 if (/^holdem\d+$/.test(channel)) {
                     handleHoldemMessage(parsed);
                 }
@@ -496,14 +573,53 @@ function authorizeFromKey(key) {
             updateAuthStatus("Authorization failed: missing player_id.", "#f87171");
             return alert("Unable to read player_id from Torn response");
         }
+
+        saveLocalApiKey(key);
         bootstrap(data.player_id);
-        setTimeout(() => {
-            updateAuthStatus(
-                STATE.authorized ? "Status: authorized" : "Status: not authorized",
-                STATE.authorized ? "#4ade80" : "#cbd5e1"
-            );
-        }, 700);
     });
+}
+
+function renderMenuStatus() {
+    const el = document.getElementById("atpu-menu-status");
+    if (!el) return;
+
+    const authDot = STATE.authorized ? "#22c55e" : "#ef4444";
+    const sessionDot = STATE.sessionId ? "#22c55e" : (STATE.sessionStarting ? "#f59e0b" : "#ef4444");
+    const queueDot = STATE.eventQueue.length ? "#f59e0b" : "#22c55e";
+    const hudDot = STATE.hudVisible ? "#22c55e" : "#6b7280";
+
+    el.innerHTML =
+        `<div style="display:flex;flex-direction:column;gap:6px;font-size:12px;">` +
+            `<div style="display:flex;align-items:center;gap:8px;">` +
+                `<span style="width:8px;height:8px;border-radius:50%;background:${authDot};display:inline-block;"></span>` +
+                `<span>AUTH</span>` +
+            `</div>` +
+            `<div style="display:flex;align-items:center;gap:8px;">` +
+                `<span style="width:8px;height:8px;border-radius:50%;background:${sessionDot};display:inline-block;"></span>` +
+                `<span>SESSION</span>` +
+            `</div>` +
+            `<div style="display:flex;align-items:center;gap:8px;">` +
+                `<span style="width:8px;height:8px;border-radius:50%;background:${queueDot};display:inline-block;"></span>` +
+                `<span>Q: ${STATE.eventQueue.length}</span>` +
+            `</div>` +
+            `<div style="display:flex;align-items:center;gap:8px;">` +
+                `<span style="width:8px;height:8px;border-radius:50%;background:${hudDot};display:inline-block;"></span>` +
+                `<span>HUD: ${STATE.hudVisible ? "ON" : "OFF"}</span>` +
+            `</div>` +
+            `<div style="opacity:0.8;">T: ${STATE.activeTableId || "-"}</div>` +
+        `</div>`;
+}
+
+function setHudVisible(value) {
+    saveHudVisible(value);
+    renderHUD();
+    renderMenuStatus();
+
+    const btn = document.getElementById("atpu-hud-toggle");
+    if (btn) {
+        btn.textContent = STATE.hudVisible ? "HUD ON" : "HUD OFF";
+        btn.style.background = STATE.hudVisible ? "#15803d" : "#444";
+    }
 }
 
 function mountButton() {
@@ -518,11 +634,13 @@ function mountButton() {
         left: "10px",
         bottom: "10px",
         zIndex: 999999,
-        width: "38px",
-        height: "32px",
+        width: "40px",
+        height: "34px",
         borderRadius: "50%",
         background: "#000",
-        color: "#fff"
+        color: "#fff",
+        border: "1px solid rgba(255,255,255,0.15)",
+        fontWeight: "700"
     });
 
     const modal = document.createElement("div");
@@ -553,17 +671,23 @@ function mountButton() {
     panel.innerHTML = `
         <div style="font-weight:700;margin-bottom:8px;">ATornPokerUtility</div>
         <div id="atpu-auth-status" style="font-size:12px;opacity:0.9;margin-bottom:8px;color:#cbd5e1;">Status: not authorized</div>
+
         <a href="https://www.torn.com/preferences.php#tab=api?step=addNewKey&title=ATornPokerUtility&user=basic"
            target="_blank"
            style="display:inline-block;margin-bottom:8px;color:#9fd4ff;">Create custom API key (basic / owner id)</a>
+
         <input id="atpu-key-input" type="password" placeholder="Paste Torn custom API key"
-               style="width:100%;padding:8px;border-radius:8px;border:none;background:#1a2336;color:#fff;margin-bottom:8px;">
-        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+               style="width:100%;padding:8px;border-radius:8px;border:none;background:#1a2336;color:#fff;margin-bottom:10px;">
+
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">
             <button id="atpu-auth-run" style="padding:8px 10px;border:none;border-radius:8px;background:#335eea;color:#fff;font-weight:700;">Authorize</button>
-            <button id="atpu-repair-run" style="padding:8px 10px;border:none;border-radius:8px;background:#7c3aed;color:#fff;font-weight:700;">Repair server</button>
+            <button id="atpu-hud-toggle" style="padding:8px 10px;border:none;border-radius:8px;background:#15803d;color:#fff;font-weight:700;">HUD ON</button>
             <button id="atpu-auth-logout" style="padding:8px 10px;border:none;border-radius:8px;background:#b91c1c;color:#fff;">Logout</button>
             <button id="atpu-auth-close" style="padding:8px 10px;border:none;border-radius:8px;background:#444;color:#fff;">Close</button>
         </div>
+
+        <div id="atpu-menu-status"
+             style="padding:10px;border-radius:10px;background:#0b1220;border:1px solid rgba(255,255,255,0.08);"></div>
     `;
 
     modal.appendChild(panel);
@@ -571,6 +695,8 @@ function mountButton() {
     document.body.appendChild(btn);
 
     const input = panel.querySelector("#atpu-key-input");
+    input.value = loadLocalApiKey();
+
     panel.querySelector("#atpu-auth-run").onclick = () => {
         const key = String(input.value || "").trim();
         if (!key) return;
@@ -578,10 +704,15 @@ function mountButton() {
         authorizeFromKey(key);
         modal.style.display = "none";
     };
-    panel.querySelector("#atpu-repair-run").onclick = () => tryMaintenanceRepair("manual");
+
+    panel.querySelector("#atpu-hud-toggle").onclick = () => {
+        setHudVisible(!STATE.hudVisible);
+    };
+
     panel.querySelector("#atpu-auth-logout").onclick = () => {
         clearAuthState();
         updateAuthStatus("Status: not authorized", "#cbd5e1");
+        renderMenuStatus();
     };
 
     panel.querySelector("#atpu-auth-close").onclick = () => {
@@ -597,13 +728,31 @@ function mountButton() {
             STATE.authorized ? "Status: authorized" : "Status: not authorized",
             STATE.authorized ? "#4ade80" : "#cbd5e1"
         );
+        input.value = loadLocalApiKey();
         modal.style.display = modal.style.display === "none" ? "block" : "none";
+        renderMenuStatus();
     };
+
+    setHudVisible(STATE.hudVisible);
+    renderMenuStatus();
 }
 
 function waitForBody(fn) {
     if (document.body) return fn();
     setTimeout(() => waitForBody(fn), 200);
+}
+
+function autoAuthorizeFromLocalKey() {
+    const now = Date.now();
+    if (now - STATE.authCheckedAt < 10000) return;
+    STATE.authCheckedAt = now;
+
+    if (STATE.authorized && STATE.publicToken) return;
+
+    const key = loadLocalApiKey();
+    if (!key) return;
+
+    authorizeFromKey(key);
 }
 
 function boot() {
@@ -612,12 +761,16 @@ function boot() {
 
     installWS();
     loadAuthState();
+    loadHudVisible();
 
     waitForBody(() => {
         mountButton();
+        autoAuthorizeFromLocalKey();
+
         setInterval(flush, 3000);
         setInterval(renderHUD, 1000);
         setInterval(loadStatsFromServer, 5000);
+        setInterval(autoAuthorizeFromLocalKey, 15000);
     });
 }
 
