@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ATornPokerUtility
 // @namespace    zulu.atornpoker.utility
-// @version      4.9.0
+// @version      4.9.1
 // @description  Torn Poker HUD with whitelist auth and server stats (PDA compatible)
 // @match        https://www.torn.com/page.php?sid=holdem*
 // @match        https://www.torn.com/pda.php?sid=holdem*
@@ -23,7 +23,7 @@ if (globalWindow.__A_TPU__) return;
 globalWindow.__A_TPU__ = true;
 
 const SERVER = "https://torn-poker-server-production.up.railway.app";
-const SCRIPT_VERSION = "4.9.0";
+const SCRIPT_VERSION = "4.9.3";
 
 const LS = {
     token: "atpu.publicToken",
@@ -43,7 +43,8 @@ const STATE = {
     started: false,
     lastFlush: "-",
     authCheckedAt: 0,
-    hudVisible: true
+    hudVisible: true,
+    pageVisible: true
 };
 
 const PLAYER_STATS = {};
@@ -72,6 +73,10 @@ function api(path, method, body, cb) {
 
 function safeParse(text, fallback = {}) {
     try { return JSON.parse(text); } catch { return fallback; }
+}
+
+function isPageActive() {
+    return !document.hidden;
 }
 
 function saveAuthState() {
@@ -220,7 +225,7 @@ function bootstrap(ownerId) {
         saveAuthState();
         updateAuthStatus("Status: authorized", "#4ade80");
 
-        if (STATE.activeTableId && !STATE.sessionId) {
+        if (STATE.activeTableId && !STATE.sessionId && isPageActive()) {
             startSession();
         }
 
@@ -236,6 +241,7 @@ function updateAuthStatus(message, color) {
 }
 
 function startSession() {
+    if (!isPageActive()) return;
     if (!STATE.publicToken || !STATE.activeTableId || STATE.sessionId || STATE.sessionStarting) return;
 
     STATE.sessionStarting = true;
@@ -260,6 +266,7 @@ function startSession() {
 }
 
 function flush() {
+    if (!isPageActive()) return;
     if (!STATE.sessionId || !STATE.eventQueue.length) return;
 
     const batch = STATE.eventQueue.splice(0, 50);
@@ -282,6 +289,7 @@ function flush() {
 }
 
 function loadStatsFromServer() {
+    if (!isPageActive()) return;
     if (!STATE.authorized || !STATE.publicToken || !STATE.activeTableId) return;
 
     api(`/api/public/stats/table?table_id=${encodeURIComponent(String(STATE.activeTableId))}`, "GET", null, (err, res) => {
@@ -335,6 +343,7 @@ function mapStatusToType(status) {
 }
 
 function queue(tableId, ev) {
+    if (!isPageActive()) return;
     if (!STATE.authorized) return;
     if (String(tableId) !== String(STATE.activeTableId)) return;
 
@@ -517,9 +526,15 @@ function handleHoldemMessage(parsed) {
     if (!m) return;
 
     const tableId = m[1];
+
+    if (!isPageActive()) return;
+
     switchActiveTable(tableId);
 
-    if (STATE.authorized && !STATE.sessionId) startSession();
+    if (STATE.authorized && !STATE.sessionId && !STATE.sessionStarting) {
+        startSession();
+    }
+
     if (!STATE.authorized) return;
 
     const eventType = msg.eventType || "";
@@ -544,6 +559,7 @@ function installWS() {
             const ws = new target(...args);
             ws.addEventListener("message", e => {
                 if (typeof e.data !== "string") return;
+
                 const parsed = safeParse(e.data, null);
                 if (!parsed) return;
 
@@ -587,6 +603,7 @@ function renderMenuStatus() {
     const sessionDot = STATE.sessionId ? "#22c55e" : (STATE.sessionStarting ? "#f59e0b" : "#ef4444");
     const queueDot = STATE.eventQueue.length ? "#f59e0b" : "#22c55e";
     const hudDot = STATE.hudVisible ? "#22c55e" : "#6b7280";
+    const pageDot = isPageActive() ? "#22c55e" : "#ef4444";
 
     el.innerHTML =
         `<div style="display:flex;flex-direction:column;gap:6px;font-size:12px;">` +
@@ -602,9 +619,13 @@ function renderMenuStatus() {
                 `<span style="width:8px;height:8px;border-radius:50%;background:${queueDot};display:inline-block;"></span>` +
                 `<span>Q: ${STATE.eventQueue.length}</span>` +
             `</div>` +
-            `<div style="display:flex;align-items:center;gap:8px;">` +
+            `<div style="display:flex;alignments:center;gap:8px;">` +
                 `<span style="width:8px;height:8px;border-radius:50%;background:${hudDot};display:inline-block;"></span>` +
                 `<span>HUD: ${STATE.hudVisible ? "ON" : "OFF"}</span>` +
+            `</div>` +
+            `<div style="display:flex;align-items:center;gap:8px;">` +
+                `<span style="width:8px;height:8px;border-radius:50%;background:${pageDot};display:inline-block;"></span>` +
+                `<span>PAGE: ${isPageActive() ? "ACTIVE" : "BACKGROUND"}</span>` +
             `</div>` +
             `<div style="opacity:0.8;">T: ${STATE.activeTableId || "-"}</div>` +
         `</div>`;
@@ -745,8 +766,10 @@ function waitForBody(fn) {
 function autoAuthorizeFromLocalKey() {
     const now = Date.now();
     if (now - STATE.authCheckedAt < 10000) return;
+
     STATE.authCheckedAt = now;
 
+    if (!isPageActive()) return;
     if (STATE.authorized && STATE.publicToken) return;
 
     const key = loadLocalApiKey();
@@ -755,11 +778,43 @@ function autoAuthorizeFromLocalKey() {
     authorizeFromKey(key);
 }
 
+function installVisibilityGuard() {
+    STATE.pageVisible = isPageActive();
+
+    document.addEventListener("visibilitychange", () => {
+        const nowVisible = isPageActive();
+        STATE.pageVisible = nowVisible;
+
+        if (!nowVisible) {
+            STATE.sessionStarting = false;
+            STATE.eventQueue = [];
+        } else {
+            if (STATE.authorized && STATE.activeTableId && !STATE.sessionId) {
+                startSession();
+            }
+            loadStatsFromServer();
+        }
+
+        renderMenuStatus();
+    });
+
+    globalWindow.addEventListener("focus", () => {
+        STATE.pageVisible = isPageActive();
+        renderMenuStatus();
+    });
+
+    globalWindow.addEventListener("blur", () => {
+        STATE.pageVisible = isPageActive();
+        renderMenuStatus();
+    });
+}
+
 function boot() {
     if (STATE.started) return;
     STATE.started = true;
 
     installWS();
+    installVisibilityGuard();
     loadAuthState();
     loadHudVisible();
 
@@ -771,6 +826,7 @@ function boot() {
         setInterval(renderHUD, 1000);
         setInterval(loadStatsFromServer, 5000);
         setInterval(autoAuthorizeFromLocalKey, 15000);
+        setInterval(renderMenuStatus, 2000);
     });
 }
 
