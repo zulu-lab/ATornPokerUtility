@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ATornPokerUtility
 // @namespace    zulu.atornpoker.utility
-// @version      4.9.1
+// @version      4.9.2
 // @description  Torn Poker HUD with whitelist auth and server stats (PDA compatible)
 // @match        https://www.torn.com/page.php?sid=holdem*
 // @match        https://www.torn.com/pda.php?sid=holdem*
@@ -23,7 +23,7 @@ if (globalWindow.__A_TPU__) return;
 globalWindow.__A_TPU__ = true;
 
 const SERVER = "https://torn-poker-server-production.up.railway.app";
-const SCRIPT_VERSION = "4.9.3";
+const SCRIPT_VERSION = "4.9.1";
 
 const LS = {
     token: "atpu.publicToken",
@@ -76,7 +76,7 @@ function safeParse(text, fallback = {}) {
 }
 
 function isPageActive() {
-    return !document.hidden;
+    return !document.hidden && document.hasFocus();
 }
 
 function saveAuthState() {
@@ -558,6 +558,7 @@ function installWS() {
         construct(target, args) {
             const ws = new target(...args);
             ws.addEventListener("message", e => {
+                if (!isPageActive()) return;
                 if (typeof e.data !== "string") return;
 
                 const parsed = safeParse(e.data, null);
@@ -619,7 +620,7 @@ function renderMenuStatus() {
                 `<span style="width:8px;height:8px;border-radius:50%;background:${queueDot};display:inline-block;"></span>` +
                 `<span>Q: ${STATE.eventQueue.length}</span>` +
             `</div>` +
-            `<div style="display:flex;alignments:center;gap:8px;">` +
+            `<div style="display:flex;align-items:center;gap:8px;">` +
                 `<span style="width:8px;height:8px;border-radius:50%;background:${hudDot};display:inline-block;"></span>` +
                 `<span>HUD: ${STATE.hudVisible ? "ON" : "OFF"}</span>` +
             `</div>` +
@@ -781,11 +782,10 @@ function autoAuthorizeFromLocalKey() {
 function installVisibilityGuard() {
     STATE.pageVisible = isPageActive();
 
-    document.addEventListener("visibilitychange", () => {
-        const nowVisible = isPageActive();
-        STATE.pageVisible = nowVisible;
+    function refreshPageState() {
+        STATE.pageVisible = isPageActive();
 
-        if (!nowVisible) {
+        if (!STATE.pageVisible) {
             STATE.sessionStarting = false;
             STATE.eventQueue = [];
         } else {
@@ -796,17 +796,11 @@ function installVisibilityGuard() {
         }
 
         renderMenuStatus();
-    });
+    }
 
-    globalWindow.addEventListener("focus", () => {
-        STATE.pageVisible = isPageActive();
-        renderMenuStatus();
-    });
-
-    globalWindow.addEventListener("blur", () => {
-        STATE.pageVisible = isPageActive();
-        renderMenuStatus();
-    });
+    document.addEventListener("visibilitychange", refreshPageState);
+    globalWindow.addEventListener("focus", refreshPageState);
+    globalWindow.addEventListener("blur", refreshPageState);
 }
 
 function boot() {
