@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ATornPokerUtility
 // @namespace    zulu.atornpoker.utility
-// @version      4.9.2
+// @version      4.9.5
 // @description  Torn Poker HUD with whitelist auth and server stats (PDA compatible)
 // @match        https://www.torn.com/page.php?sid=holdem*
 // @match        https://www.torn.com/pda.php?sid=holdem*
@@ -13,6 +13,8 @@
 // @connect      api.torn.com
 // @run-at       document-start
 // @license      UNLICENSED
+// @downloadURL  https://update.greasyfork.org/scripts/571444/ATornPokerUtility.user.js
+// @updateURL    https://update.greasyfork.org/scripts/571444/ATornPokerUtility.meta.js
 // ==/UserScript==
 
 (function () {
@@ -23,7 +25,7 @@ if (globalWindow.__A_TPU__) return;
 globalWindow.__A_TPU__ = true;
 
 const SERVER = "https://torn-poker-server-production.up.railway.app";
-const SCRIPT_VERSION = "4.9.1";
+const SCRIPT_VERSION = "4.9.2";
 
 const LS = {
     token: "atpu.publicToken",
@@ -347,6 +349,8 @@ function queue(tableId, ev) {
     if (!STATE.authorized) return;
     if (String(tableId) !== String(STATE.activeTableId)) return;
 
+    const handRef = ev.hand_id || null;
+
     STATE.eventQueue.push({
         table_id: String(tableId),
         type: ev.type,
@@ -355,10 +359,10 @@ function queue(tableId, ev) {
         amount: ev.amount || null,
         stack_before: ev.stack_before || null,
         stack_after: ev.stack_after || null,
-        hand_id: ev.hand_id || null,
+        hand_id: handRef,
         event_ts: Date.now(),
         metadata: {
-            raw_hand_ref: ev.hand_id || null
+            raw_hand_ref: handRef
         }
     });
 
