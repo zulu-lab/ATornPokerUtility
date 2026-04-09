@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ATornPokerUtility
 // @namespace    zulu.atornpoker.utility
-// @version      4.9.6
+// @version      5.0.1
 // @description  Torn Poker HUD with whitelist auth and server stats (PDA compatible)
 // @match        https://www.torn.com/page.php?sid=holdem*
 // @match        https://www.torn.com/pda.php?sid=holdem*
@@ -25,7 +25,7 @@ if (globalWindow.__A_TPU__) return;
 globalWindow.__A_TPU__ = true;
 
 const SERVER = "https://torn-poker-server-production.up.railway.app";
-const SCRIPT_VERSION = "5.0.0";
+const SCRIPT_VERSION = "5.0.1";
 
 const LS = {
     token: "atpu.publicToken",
@@ -33,6 +33,42 @@ const LS = {
     tornApiKey: "atpu.tornApiKey",
     hudVisible: "atpu.hudVisible"
 };
+
+const ALLOWED_TYPES = new Set([
+    "join",
+    "leave",
+    "stack_update",
+    "fold",
+    "call",
+    "call_preflop",
+    "raise",
+    "raise_preflop",
+    "bet",
+    "check",
+    "allin",
+    "win",
+    "hand_dealt",
+    "saw_flop",
+    "showdown",
+    "win_showdown",
+    "limp",
+    "3bet",
+    "faced_raise_preflop",
+    "fold_to_3bet",
+    "faced_3bet",
+    "cbet_flop",
+    "raised_preflop_opportunity",
+    "fold_to_cbet",
+    "faced_cbet",
+    "squeeze",
+    "squeeze_opportunity",
+    "donk_bet",
+    "donk_opportunity",
+    "check_raise",
+    "check_raise_opportunity",
+    "fold_bb_to_steal",
+    "faced_steal_bb"
+]);
 
 const STATE = {
     sessionId: null,
@@ -83,6 +119,11 @@ function api(path, method, body, cb) {
 
 function safeParse(text, fallback = {}) {
     try { return JSON.parse(text); } catch { return fallback; }
+}
+
+function safeNumber(value) {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
 }
 
 function isPageActive() {
@@ -154,10 +195,65 @@ function ensureTable(tableId) {
             currentHandId: null,
             currentStreet: "preflop",
             actionIndex: 0,
-            lastAggressorId: null
+            streetActionIndex: 0,
+            lastAggressorId: null,
+            preflopAggressorId: null,
+            flopCbetterId: null,
+            preflopRaiseCount: 0,
+            streetBetCount: 0,
+            playerCheckedStreet: {},
+            emittedHandDealt: false,
+            sawFlopEmitted: {},
+            showdownEmitted: {},
+            winShowdownEmitted: {},
+            facedCbetEmitted: {},
+            foldToCbetEmitted: {},
+            faced3BetEmitted: {},
+            foldTo3BetEmitted: {},
+            facedRaisePreflopEmitted: {},
+            raisedPreflopOpportunityEmitted: {},
+            squeezeOpportunityEmitted: {},
+            squeezeEmitted: {},
+            donkOpportunityEmitted: {},
+            donkEmitted: {},
+            checkRaiseOpportunityEmitted: {},
+            checkRaiseEmitted: {},
+            facedStealBbEmitted: {},
+            foldBbToStealEmitted: {}
         };
     }
     return STATE.tables[key];
+}
+
+function resetHandState(table, newHandId) {
+    table.currentHandId = String(newHandId || "");
+    table.currentStreet = "preflop";
+    table.actionIndex = 0;
+    table.streetActionIndex = 0;
+    table.lastAggressorId = null;
+    table.preflopAggressorId = null;
+    table.flopCbetterId = null;
+    table.preflopRaiseCount = 0;
+    table.streetBetCount = 0;
+    table.playerCheckedStreet = {};
+    table.emittedHandDealt = false;
+    table.sawFlopEmitted = {};
+    table.showdownEmitted = {};
+    table.winShowdownEmitted = {};
+    table.facedCbetEmitted = {};
+    table.foldToCbetEmitted = {};
+    table.faced3BetEmitted = {};
+    table.foldTo3BetEmitted = {};
+    table.facedRaisePreflopEmitted = {};
+    table.raisedPreflopOpportunityEmitted = {};
+    table.squeezeOpportunityEmitted = {};
+    table.squeezeEmitted = {};
+    table.donkOpportunityEmitted = {};
+    table.donkEmitted = {};
+    table.checkRaiseOpportunityEmitted = {};
+    table.checkRaiseEmitted = {};
+    table.facedStealBbEmitted = {};
+    table.foldBbToStealEmitted = {};
 }
 
 function ensurePlayerStats(userId, name) {
@@ -205,6 +301,8 @@ function normalizeHandId(msg, fallback) {
 function extractBoardCards(msg) {
     const candidates = [
         msg?.board,
+        msg?.boardCards,
+        msg?.board_cards,
         msg?.communityCards,
         msg?.community_cards,
         msg?.tableCards,
@@ -218,9 +316,9 @@ function extractBoardCards(msg) {
     ];
 
     for (const candidate of candidates) {
-        if (Array.isArray(candidate)) return candidate.filter(Boolean);
+        if (Array.isArray(candidate)) return candidate.filter(Boolean).map(v => String(v));
         if (candidate && typeof candidate === "object") {
-            const values = Object.values(candidate).filter(Boolean);
+            const values = Object.values(candidate).filter(Boolean).map(v => String(v));
             if (values.length) return values;
         }
     }
@@ -240,21 +338,36 @@ function inferStreetFromMessage(msg, fallbackStreet) {
     return fallbackStreet || "preflop";
 }
 
+function cloneLightPlayers(playersById) {
+    return Object.values(playersById || {}).map(p => ({
+        id: p.id,
+        name: p.name,
+        seat: p.seat || null,
+        status: p.status || null,
+        stack: p.stack ?? null,
+        folded: !!p.folded
+    }));
+}
+
 function syncTableHandContext(table, msg) {
     const nextHandId = normalizeHandId(msg, table.currentHandId);
     const handChanged = !!nextHandId && String(nextHandId) !== String(table.currentHandId || "");
 
     if (handChanged) {
-        table.currentHandId = String(nextHandId);
-        table.currentStreet = "preflop";
-        table.actionIndex = 0;
-        table.lastAggressorId = null;
+        resetHandState(table, nextHandId);
     } else if (!table.currentHandId && nextHandId) {
-        table.currentHandId = String(nextHandId);
+        resetHandState(table, nextHandId);
     }
 
-    const inferredStreet = inferStreetFromMessage(msg, table.currentStreet);
-    if (inferredStreet) {
+    const previousStreet = table.currentStreet || "preflop";
+    const inferredStreet = inferStreetFromMessage(msg, previousStreet);
+
+    if (inferredStreet !== previousStreet) {
+        table.currentStreet = inferredStreet;
+        table.streetActionIndex = 0;
+        table.streetBetCount = 0;
+        table.playerCheckedStreet = {};
+    } else {
         table.currentStreet = inferredStreet;
     }
 }
@@ -405,7 +518,8 @@ function loadStatsFromServer() {
                 name: row.player_name || PLAYER_STATS[id]?.name || ("ID " + id),
                 hands,
                 vpipHands: (vpip / 100) * hands,
-                pfrHands: (pfr / 100) * hands
+                pfrHands: (pfr / 100) * hands,
+                raw: row
             };
         });
 
@@ -431,6 +545,7 @@ function mapStatusToType(status) {
     if (s.includes("raise")) return "raise";
     if (s === "bet" || s.includes(" bet")) return "bet";
     if (s.includes("all in")) return "allin";
+    if (s.includes("winner") || s.includes("won") || s.includes("wins") || s.includes("collected")) return "win";
 
     return null;
 }
@@ -439,33 +554,89 @@ function queue(tableId, ev) {
     if (!isPageActive()) return;
     if (!STATE.authorized) return;
     if (String(tableId) !== String(STATE.activeTableId)) return;
+    if (!ALLOWED_TYPES.has(String(ev.type || "").toLowerCase())) return;
 
     const handRef = ev.hand_id || null;
+    const metadata = ev.metadata && typeof ev.metadata === "object" ? { ...ev.metadata } : {};
+
+    metadata.raw_hand_ref = handRef;
+    metadata.street = ev.street ?? metadata.street ?? null;
+    metadata.action_index = Number.isFinite(ev.action_index) ? ev.action_index : (Number.isFinite(metadata.action_index) ? metadata.action_index : null);
+    metadata.is_aggressor = typeof ev.is_aggressor === "boolean" ? ev.is_aggressor : (typeof metadata.is_aggressor === "boolean" ? metadata.is_aggressor : null);
+    metadata.hand_result = ev.hand_result ?? metadata.hand_result ?? null;
+    metadata.seat = ev.seat ?? metadata.seat ?? null;
+    metadata.status_raw = ev.status_raw ?? metadata.status_raw ?? null;
+    metadata.previous_status = ev.previous_status ?? metadata.previous_status ?? null;
+    metadata.raw_event_type = ev.raw_event_type ?? metadata.raw_event_type ?? ev.type ?? null;
+    metadata.board_cards = Array.isArray(ev.board_cards) ? ev.board_cards : (Array.isArray(metadata.board_cards) ? metadata.board_cards : null);
+    metadata.players_snapshot_light = Array.isArray(ev.players_snapshot_light)
+        ? ev.players_snapshot_light
+        : (Array.isArray(metadata.players_snapshot_light) ? metadata.players_snapshot_light : null);
 
     STATE.eventQueue.push({
         table_id: String(tableId),
-        type: ev.type,
-        player_id: ev.player_id,
-        player_name: ev.player_name,
-        amount: ev.amount || null,
-        stack_before: ev.stack_before || null,
-        stack_after: ev.stack_after || null,
+        type: String(ev.type || "").toLowerCase(),
+        player_id: ev.player_id ?? null,
+        player_name: ev.player_name ?? null,
+        amount: ev.amount ?? null,
+        stack_before: ev.stack_before ?? null,
+        stack_after: ev.stack_after ?? null,
         hand_id: handRef,
-        street: ev.street || null,
-        action_index: Number.isFinite(ev.action_index) ? ev.action_index : null,
-        is_aggressor: typeof ev.is_aggressor === "boolean" ? ev.is_aggressor : null,
-        hand_result: ev.hand_result || null,
+        street: metadata.street,
+        action_index: metadata.action_index,
+        is_aggressor: metadata.is_aggressor,
+        hand_result: metadata.hand_result,
         event_ts: Date.now(),
-        metadata: {
-            raw_hand_ref: handRef,
-            street: ev.street || null,
-            action_index: Number.isFinite(ev.action_index) ? ev.action_index : null,
-            is_aggressor: typeof ev.is_aggressor === "boolean" ? ev.is_aggressor : null,
-            hand_result: ev.hand_result || null
-        }
+        metadata
     });
 
     renderMenuStatus();
+}
+
+function emitEvent(tableId, player, type, extra = {}) {
+    const table = ensureTable(tableId);
+    const eventType = String(type || "").toLowerCase();
+    if (!ALLOWED_TYPES.has(eventType)) return;
+
+    const metadataPlayers = cloneLightPlayers(table.playersById);
+    const boardCards = Array.isArray(extra.board_cards) ? extra.board_cards : extractBoardCards(extra.msg || {});
+    const previousStatus = extra.previous_status ?? null;
+    const statusRaw = extra.status_raw ?? player?.status ?? null;
+    const handResult = extra.hand_result ?? inferHandResult(eventType, statusRaw);
+    const street = extra.street || table.currentStreet || "preflop";
+    const actionIndex = Number.isFinite(extra.action_index) ? extra.action_index : table.actionIndex || 0;
+
+    queue(tableId, {
+        type: eventType,
+        player_id: player ? Number(player.id) : null,
+        player_name: player ? player.name : null,
+        amount: extra.amount ?? null,
+        stack_before: extra.stack_before ?? (player ? player.stack : null),
+        stack_after: extra.stack_after ?? (player ? player.stack : null),
+        hand_id: table.currentHandId || null,
+        street,
+        action_index: actionIndex,
+        is_aggressor: typeof extra.is_aggressor === "boolean" ? extra.is_aggressor : null,
+        hand_result: handResult,
+        seat: extra.seat ?? (player ? (player.seat ?? null) : null),
+        status_raw: statusRaw,
+        previous_status: previousStatus,
+        raw_event_type: extra.raw_event_type ?? eventType,
+        board_cards: boardCards,
+        players_snapshot_light: metadataPlayers,
+        metadata: {
+            street,
+            action_index: actionIndex,
+            is_aggressor: typeof extra.is_aggressor === "boolean" ? extra.is_aggressor : null,
+            hand_result: handResult,
+            seat: extra.seat ?? (player ? (player.seat ?? null) : null),
+            status_raw: statusRaw,
+            previous_status: previousStatus,
+            raw_event_type: extra.raw_event_type ?? eventType,
+            board_cards: boardCards,
+            players_snapshot_light: metadataPlayers
+        }
+    });
 }
 
 function getStyle(vpip, pfr, hands) {
@@ -983,7 +1154,220 @@ function renderHUD() {
     cleanupStaleHud(validPlayerIds);
 }
 
+function emitHandDealtIfNeeded(tableId) {
+    const table = ensureTable(tableId);
+    if (!table.currentHandId || table.emittedHandDealt) return;
+
+    const boardCards = [];
+    Object.values(table.playersById).forEach(player => {
+        emitEvent(tableId, player, "hand_dealt", {
+            street: "preflop",
+            action_index: 0,
+            is_aggressor: false,
+            hand_result: null,
+            seat: player.seat || null,
+            status_raw: player.status || null,
+            previous_status: null,
+            raw_event_type: "hand_dealt",
+            board_cards: boardCards
+        });
+    });
+
+    table.emittedHandDealt = true;
+}
+
+function emitSawFlopIfNeeded(tableId, boardCards) {
+    const table = ensureTable(tableId);
+    if (table.currentStreet !== "flop") return;
+    if (!Array.isArray(boardCards) || boardCards.length < 3) return;
+
+    Object.values(table.playersById).forEach(player => {
+        if (player.folded) return;
+        if (table.sawFlopEmitted[player.id]) return;
+
+        emitEvent(tableId, player, "saw_flop", {
+            street: "flop",
+            action_index: table.actionIndex,
+            is_aggressor: false,
+            hand_result: null,
+            seat: player.seat || null,
+            status_raw: player.status || null,
+            previous_status: null,
+            raw_event_type: "saw_flop",
+            board_cards: boardCards
+        });
+
+        table.sawFlopEmitted[player.id] = true;
+    });
+}
+
+function maybeEmitPreflopAdvanced(tableId, table, player, prev, type, commonMeta) {
+    const playerId = String(player.id);
+    const handKey = table.currentHandId || "nohand";
+
+    if ((type === "call_preflop" || type === "fold") && table.preflopRaiseCount >= 1) {
+        const key = `${tableId}|${handKey}|faced_raise_preflop|${playerId}|${table.actionIndex}`;
+        if (!table.facedRaisePreflopEmitted[key]) {
+            emitEvent(tableId, player, "faced_raise_preflop", commonMeta);
+            table.facedRaisePreflopEmitted[key] = true;
+        }
+    }
+
+    if (type === "raise_preflop" || type === "allin") {
+        const keyOpp = `${tableId}|${handKey}|raised_preflop_opportunity|${playerId}|${table.actionIndex}`;
+        if (!table.raisedPreflopOpportunityEmitted[keyOpp]) {
+            emitEvent(tableId, player, "raised_preflop_opportunity", commonMeta);
+            table.raisedPreflopOpportunityEmitted[keyOpp] = true;
+        }
+    }
+
+    if (type === "call_preflop" && table.preflopRaiseCount === 0) {
+        emitEvent(tableId, player, "limp", commonMeta);
+    }
+
+    if ((type === "raise_preflop" || type === "allin") && table.preflopRaiseCount === 1) {
+        emitEvent(tableId, player, "3bet", { ...commonMeta, is_aggressor: true });
+
+        const keyFaced = `${tableId}|${handKey}|faced_3bet|${playerId}|${table.actionIndex}`;
+        if (!table.faced3BetEmitted[keyFaced]) {
+            emitEvent(tableId, player, "faced_3bet", commonMeta);
+            table.faced3BetEmitted[keyFaced] = true;
+        }
+    }
+
+    if (type === "fold" && table.preflopRaiseCount >= 2) {
+        const keyFold3 = `${tableId}|${handKey}|fold_to_3bet|${playerId}|${table.actionIndex}`;
+        if (!table.foldTo3BetEmitted[keyFold3]) {
+            emitEvent(tableId, player, "fold_to_3bet", commonMeta);
+            table.foldTo3BetEmitted[keyFold3] = true;
+        }
+    }
+
+    const isBbSeat = String(player.seat || "").toLowerCase() === "bb";
+    const isLateStealPressure = table.preflopRaiseCount >= 1;
+
+    if (isBbSeat && isLateStealPressure) {
+        const facedStealKey = `${tableId}|${handKey}|faced_steal_bb|${playerId}|${table.actionIndex}`;
+        if (!table.facedStealBbEmitted[facedStealKey]) {
+            emitEvent(tableId, player, "faced_steal_bb", commonMeta);
+            table.facedStealBbEmitted[facedStealKey] = true;
+        }
+
+        if (type === "fold") {
+            const foldStealKey = `${tableId}|${handKey}|fold_bb_to_steal|${playerId}|${table.actionIndex}`;
+            if (!table.foldBbToStealEmitted[foldStealKey]) {
+                emitEvent(tableId, player, "fold_bb_to_steal", commonMeta);
+                table.foldBbToStealEmitted[foldStealKey] = true;
+            }
+        }
+    }
+
+    const othersStillIn =
+        Object.values(table.playersById).filter(p => !p.folded && String(p.id) !== playerId).length;
+
+    if ((type === "raise_preflop" || type === "allin") && table.preflopRaiseCount >= 2 && othersStillIn >= 2) {
+        const sqOppKey = `${tableId}|${handKey}|squeeze_opportunity|${playerId}|${table.actionIndex}`;
+        if (!table.squeezeOpportunityEmitted[sqOppKey]) {
+            emitEvent(tableId, player, "squeeze_opportunity", commonMeta);
+            table.squeezeOpportunityEmitted[sqOppKey] = true;
+        }
+
+        const sqKey = `${tableId}|${handKey}|squeeze|${playerId}|${table.actionIndex}`;
+        if (!table.squeezeEmitted[sqKey]) {
+            emitEvent(tableId, player, "squeeze", { ...commonMeta, is_aggressor: true });
+            table.squeezeEmitted[sqKey] = true;
+        }
+    }
+}
+
+function maybeEmitFlopAdvanced(tableId, table, player, type, commonMeta) {
+    const playerId = String(player.id);
+    const handKey = table.currentHandId || "nohand";
+    const boardCards = commonMeta.board_cards || [];
+
+    if ((type === "bet" || type === "raise") && table.preflopAggressorId && String(table.preflopAggressorId) === playerId && table.streetBetCount === 0) {
+        table.flopCbetterId = player.id;
+        emitEvent(tableId, player, "cbet_flop", { ...commonMeta, is_aggressor: true });
+    }
+
+    if (table.flopCbetterId && String(table.flopCbetterId) !== playerId && (type === "call" || type === "fold" || type === "raise")) {
+        const keyFaced = `${tableId}|${handKey}|faced_cbet|${playerId}|${table.actionIndex}`;
+        if (!table.facedCbetEmitted[keyFaced]) {
+            emitEvent(tableId, player, "faced_cbet", commonMeta);
+            table.facedCbetEmitted[keyFaced] = true;
+        }
+    }
+
+    if (type === "fold" && table.flopCbetterId && String(table.flopCbetterId) !== playerId) {
+        const keyFold = `${tableId}|${handKey}|fold_to_cbet|${playerId}|${table.actionIndex}`;
+        if (!table.foldToCbetEmitted[keyFold]) {
+            emitEvent(tableId, player, "fold_to_cbet", commonMeta);
+            table.foldToCbetEmitted[keyFold] = true;
+        }
+    }
+
+    if ((type === "bet" || type === "raise") && table.streetBetCount === 0 && table.preflopAggressorId && String(table.preflopAggressorId) !== playerId) {
+        const keyOpp = `${tableId}|${handKey}|donk_opportunity|${playerId}|${table.actionIndex}`;
+        if (!table.donkOpportunityEmitted[keyOpp]) {
+            emitEvent(tableId, player, "donk_opportunity", commonMeta);
+            table.donkOpportunityEmitted[keyOpp] = true;
+        }
+
+        const keyDonk = `${tableId}|${handKey}|donk_bet|${playerId}|${table.actionIndex}`;
+        if (!table.donkEmitted[keyDonk]) {
+            emitEvent(tableId, player, "donk_bet", { ...commonMeta, is_aggressor: true, board_cards: boardCards });
+            table.donkEmitted[keyDonk] = true;
+        }
+    }
+
+    if (type === "raise" && table.playerCheckedStreet[playerId]) {
+        const keyOpp = `${tableId}|${handKey}|check_raise_opportunity|${playerId}|${table.actionIndex}`;
+        if (!table.checkRaiseOpportunityEmitted[keyOpp]) {
+            emitEvent(tableId, player, "check_raise_opportunity", commonMeta);
+            table.checkRaiseOpportunityEmitted[keyOpp] = true;
+        }
+
+        const keyCr = `${tableId}|${handKey}|check_raise|${playerId}|${table.actionIndex}`;
+        if (!table.checkRaiseEmitted[keyCr]) {
+            emitEvent(tableId, player, "check_raise", { ...commonMeta, is_aggressor: true });
+            table.checkRaiseEmitted[keyCr] = true;
+        }
+    }
+}
+
+function maybeEmitShowdownWin(tableId, table, player, type, commonMeta) {
+    const playerId = String(player.id);
+    const handKey = table.currentHandId || "nohand";
+
+    if (type === "win" || commonMeta.hand_result === "win" || String(commonMeta.status_raw || "").toLowerCase().includes("winner")) {
+        if (!table.winShowdownEmitted[playerId]) {
+            emitEvent(tableId, player, "win_showdown", commonMeta);
+            table.winShowdownEmitted[playerId] = true;
+        }
+    }
+
+    if (String(commonMeta.status_raw || "").toLowerCase().includes("showdown")) {
+        if (!table.showdownEmitted[playerId]) {
+            emitEvent(tableId, player, "showdown", commonMeta);
+            table.showdownEmitted[playerId] = true;
+        }
+    }
+
+    const boardCards = commonMeta.board_cards || [];
+    if (boardCards.length >= 5 && (type === "win" || String(commonMeta.status_raw || "").toLowerCase().includes("showdown"))) {
+        const keySd = `${tableId}|${handKey}|showdown|${playerId}`;
+        if (!table.showdownEmitted[keySd]) {
+            emitEvent(tableId, player, "showdown", commonMeta);
+            table.showdownEmitted[keySd] = true;
+        }
+    }
+}
+
 function detectActions(tableId, table, oldPlayers, msg) {
+    const boardCards = extractBoardCards(msg);
+    emitHandDealtIfNeeded(tableId);
+    emitSawFlopIfNeeded(tableId, boardCards);
+
     Object.values(table.playersById).forEach(player => {
         const prev = oldPlayers[player.id];
         if (!prev) return;
@@ -992,26 +1376,25 @@ function detectActions(tableId, table, oldPlayers, msg) {
         const newStatus = String(player.status || "").trim();
         if (!oldStatus || !newStatus || oldStatus === newStatus) return;
 
-        const type = mapStatusToType(newStatus);
+        let type = mapStatusToType(newStatus);
         if (!type) return;
 
-        const dedupeKey = `${tableId}_${player.id}_${type}_${table.currentHandId || "nohand"}_${table.currentStreet || "nostreet"}`;
+        if (table.currentStreet === "preflop" && type === "call") type = "call_preflop";
+        if (table.currentStreet === "preflop" && type === "raise") type = "raise_preflop";
+
+        const dedupeKey = `${tableId}_${player.id}_${type}_${table.currentHandId || "nohand"}_${table.currentStreet || "nostreet"}_${table.actionIndex}`;
         if (LAST_ACTION[dedupeKey]) return;
         LAST_ACTION[dedupeKey] = true;
 
         table.actionIndex = Number(table.actionIndex || 0) + 1;
+        table.streetActionIndex = Number(table.streetActionIndex || 0) + 1;
 
-        const isAggressor = type === "raise" || type === "bet" || type === "allin";
+        const isAggressor = type === "raise" || type === "raise_preflop" || type === "bet" || type === "allin";
         if (isAggressor) {
             table.lastAggressorId = String(player.id);
         }
 
-        const handResult = inferHandResult(type, newStatus);
-
-        queue(tableId, {
-            type,
-            player_id: Number(player.id),
-            player_name: player.name,
+        const commonMeta = {
             amount: msg.amountCall || null,
             stack_before: prev.stack,
             stack_after: player.stack,
@@ -1019,8 +1402,41 @@ function detectActions(tableId, table, oldPlayers, msg) {
             street: table.currentStreet || "preflop",
             action_index: table.actionIndex,
             is_aggressor: isAggressor,
-            hand_result: handResult
-        });
+            hand_result: inferHandResult(type, newStatus),
+            seat: player.seat || null,
+            status_raw: newStatus,
+            previous_status: oldStatus,
+            raw_event_type: type,
+            board_cards: boardCards
+        };
+
+        if (table.currentStreet === "preflop") {
+            maybeEmitPreflopAdvanced(tableId, table, player, prev, type, commonMeta);
+        } else if (table.currentStreet === "flop") {
+            maybeEmitFlopAdvanced(tableId, table, player, type, commonMeta);
+        }
+
+        emitEvent(tableId, player, type, commonMeta);
+
+        if (type === "check") {
+            table.playerCheckedStreet[String(player.id)] = true;
+        }
+
+        if (["bet", "raise", "raise_preflop", "allin"].includes(type)) {
+            table.lastAggressorId = String(player.id);
+            table.streetBetCount += 1;
+
+            if (table.currentStreet === "preflop") {
+                if (!table.preflopAggressorId) table.preflopAggressorId = player.id;
+                table.preflopRaiseCount += 1;
+            }
+        }
+
+        if (type === "fold") {
+            player.folded = true;
+        }
+
+        maybeEmitShowdownWin(tableId, table, player, type, commonMeta);
     });
 }
 
@@ -1045,7 +1461,8 @@ function updatePlayersFromState(tableId, msg) {
             name,
             seat,
             status: p.status || null,
-            stack: parseMoney(p.money)
+            stack: parseMoney(p.money),
+            folded: String(p.status || "").toLowerCase().includes("fold")
         };
         ensurePlayerStats(uid, name);
     });
@@ -1075,7 +1492,8 @@ function updateFromUpdatePlayer(tableId, msg) {
             name,
             seat,
             status: p.status || null,
-            stack: parseMoney(p.money)
+            stack: parseMoney(p.money),
+            folded: String(p.status || "").toLowerCase().includes("fold")
         };
         ensurePlayerStats(uid, name);
     });
