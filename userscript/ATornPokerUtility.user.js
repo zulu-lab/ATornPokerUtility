@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ATornPokerUtility
 // @namespace    zulu.atornpoker.utility
-// @version      4.9.5
+// @version      4.9.6
 // @description  Torn Poker HUD with whitelist auth and server stats (PDA compatible)
 // @match        https://www.torn.com/page.php?sid=holdem*
 // @match        https://www.torn.com/pda.php?sid=holdem*
@@ -25,7 +25,7 @@ if (globalWindow.__A_TPU__) return;
 globalWindow.__A_TPU__ = true;
 
 const SERVER = "https://torn-poker-server-production.up.railway.app";
-const SCRIPT_VERSION = "4.9.2";
+const SCRIPT_VERSION = "5.0.0";
 
 const LS = {
     token: "atpu.publicToken",
@@ -51,6 +51,14 @@ const STATE = {
 
 const PLAYER_STATS = {};
 const LAST_ACTION = {};
+const HUD_STATE = {};
+const DETAIL_CARD_STATE = {
+    mounted: false,
+    card: null,
+    backdrop: null,
+    activePlayerId: null,
+    lastOpenAt: 0
+};
 
 function req(method, url, headers, body, cb) {
     GM_xmlhttpRequest({
@@ -101,6 +109,7 @@ function clearAuthState() {
     STATE.sessionId = null;
     STATE.sessionStarting = false;
     STATE.eventQueue = [];
+    closeDetailCard();
     try {
         localStorage.removeItem(LS.token);
         localStorage.setItem(LS.authorized, "false");
@@ -142,7 +151,10 @@ function ensureTable(tableId) {
         STATE.tables[key] = {
             id: key,
             playersById: {},
-            currentHandId: null
+            currentHandId: null,
+            currentStreet: "preflop",
+            actionIndex: 0,
+            lastAggressorId: null
         };
     }
     return STATE.tables[key];
@@ -179,6 +191,84 @@ function formatMoneyShort(value) {
     return String(Math.round(n));
 }
 
+function normalizeHandId(msg, fallback) {
+    return String(
+        msg?.token ||
+        msg?.gameToken ||
+        msg?.handId ||
+        msg?.hand_id ||
+        fallback ||
+        ""
+    );
+}
+
+function extractBoardCards(msg) {
+    const candidates = [
+        msg?.board,
+        msg?.communityCards,
+        msg?.community_cards,
+        msg?.tableCards,
+        msg?.table_cards,
+        msg?.openCards,
+        msg?.open_cards,
+        msg?.sharedCards,
+        msg?.shared_cards,
+        msg?.cardsOnTable,
+        msg?.cards_on_table
+    ];
+
+    for (const candidate of candidates) {
+        if (Array.isArray(candidate)) return candidate.filter(Boolean);
+        if (candidate && typeof candidate === "object") {
+            const values = Object.values(candidate).filter(Boolean);
+            if (values.length) return values;
+        }
+    }
+
+    return [];
+}
+
+function inferStreetFromMessage(msg, fallbackStreet) {
+    const boardCards = extractBoardCards(msg);
+    const boardCount = boardCards.length;
+
+    if (boardCount >= 5) return "river";
+    if (boardCount === 4) return "turn";
+    if (boardCount === 3) return "flop";
+    if (boardCount === 0) return "preflop";
+
+    return fallbackStreet || "preflop";
+}
+
+function syncTableHandContext(table, msg) {
+    const nextHandId = normalizeHandId(msg, table.currentHandId);
+    const handChanged = !!nextHandId && String(nextHandId) !== String(table.currentHandId || "");
+
+    if (handChanged) {
+        table.currentHandId = String(nextHandId);
+        table.currentStreet = "preflop";
+        table.actionIndex = 0;
+        table.lastAggressorId = null;
+    } else if (!table.currentHandId && nextHandId) {
+        table.currentHandId = String(nextHandId);
+    }
+
+    const inferredStreet = inferStreetFromMessage(msg, table.currentStreet);
+    if (inferredStreet) {
+        table.currentStreet = inferredStreet;
+    }
+}
+
+function inferHandResult(type, statusText) {
+    const s = String(statusText || "").toLowerCase().trim();
+
+    if (type === "fold") return "fold";
+    if (s.includes("winner") || s.includes("won") || s.includes("wins") || s.includes("collected")) return "win";
+    if (s.includes("lost") || s.includes("lose") || s.includes("loses")) return "lose";
+
+    return null;
+}
+
 function resetTableSession(newTableId) {
     STATE.sessionId = null;
     STATE.sessionStarting = false;
@@ -187,6 +277,7 @@ function resetTableSession(newTableId) {
     Object.keys(LAST_ACTION).forEach(k => delete LAST_ACTION[k]);
 
     STATE.activeTableId = String(newTableId);
+    closeDetailCard();
 
     renderMenuStatus();
 }
@@ -360,9 +451,17 @@ function queue(tableId, ev) {
         stack_before: ev.stack_before || null,
         stack_after: ev.stack_after || null,
         hand_id: handRef,
+        street: ev.street || null,
+        action_index: Number.isFinite(ev.action_index) ? ev.action_index : null,
+        is_aggressor: typeof ev.is_aggressor === "boolean" ? ev.is_aggressor : null,
+        hand_result: ev.hand_result || null,
         event_ts: Date.now(),
         metadata: {
-            raw_hand_ref: handRef
+            raw_hand_ref: handRef,
+            street: ev.street || null,
+            action_index: Number.isFinite(ev.action_index) ? ev.action_index : null,
+            is_aggressor: typeof ev.is_aggressor === "boolean" ? ev.is_aggressor : null,
+            hand_result: ev.hand_result || null
         }
     });
 
@@ -378,61 +477,510 @@ function getStyle(vpip, pfr, hands) {
     return { l: "FISH", c: "#ef4444" };
 }
 
-function renderHUD() {
-    document.querySelectorAll("[id^='player-']").forEach(box => {
-        const id = box.id.replace("player-", "");
-        const s = PLAYER_STATS[id];
-        if (!s) return;
+function isTouchLikeDevice() {
+    try {
+        return globalWindow.matchMedia && globalWindow.matchMedia("(pointer: coarse)").matches;
+    } catch {
+        return false;
+    }
+}
 
-        const currentTable = STATE.tables[String(STATE.activeTableId || "")];
-        const livePlayer = currentTable?.playersById?.[id] || null;
-        const liveStack = livePlayer?.stack ?? null;
+function ensureHudStyles() {
+    if (document.getElementById("atpu-v5-style")) return;
 
-        let hud = box.querySelector(".atpu-hud");
-        if (!hud) {
-            hud = document.createElement("div");
-            hud.className = "atpu-hud";
-
-            Object.assign(hud.style, {
-                position: "absolute",
-                top: "50%",
-                left: "50%",
-                transform: "translate(-50%, -50%)",
-                background: "rgba(0,0,0,0.86)",
-                color: "#fff",
-                fontSize: "10px",
-                lineHeight: "1.12",
-                padding: "4px 6px",
-                borderRadius: "8px",
-                zIndex: 9999,
-                pointerEvents: "none",
-                textAlign: "center",
-                minWidth: "58px",
-                maxWidth: "76px",
-                border: "1px solid rgba(255,255,255,0.08)"
-            });
-
-            if (getComputedStyle(box).position === "static") {
-                box.style.position = "relative";
-            }
-
-            box.appendChild(hud);
+    const style = document.createElement("style");
+    style.id = "atpu-v5-style";
+    style.textContent = `
+        .atpu-mini-hud {
+            position: absolute;
+            top: 6px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 9999;
+            min-width: 42px;
+            max-width: 68px;
+            padding: 3px 7px;
+            border-radius: 999px;
+            background: rgba(7,10,16,0.90);
+            color: #fff;
+            font-size: 10px;
+            line-height: 1;
+            font-weight: 800;
+            letter-spacing: 0.35px;
+            text-align: center;
+            border: 1px solid rgba(255,255,255,0.10);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.28);
+            pointer-events: auto;
+            user-select: none;
+            -webkit-user-select: none;
+            cursor: pointer;
+            opacity: 1;
+            transition: opacity 220ms ease, transform 180ms ease, box-shadow 180ms ease;
+            -webkit-tap-highlight-color: transparent;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            backdrop-filter: blur(2px);
+            touch-action: manipulation;
         }
+        .atpu-mini-hud.atpu-mini-hidden {
+            display: none !important;
+        }
+        .atpu-mini-hud.atpu-mini-faded {
+            opacity: 0.20;
+        }
+        .atpu-mini-hud.atpu-mini-active {
+            opacity: 1;
+            box-shadow: 0 6px 16px rgba(0,0,0,0.34);
+        }
+        .atpu-mini-hud.atpu-mini-flip {
+            animation: atpuMiniFlip 420ms ease;
+        }
+        @keyframes atpuMiniFlip {
+            0% { transform: translateX(-50%) rotateY(0deg) scale(1); }
+            50% { transform: translateX(-50%) rotateY(90deg) scale(1.06); }
+            100% { transform: translateX(-50%) rotateY(180deg) scale(1); }
+        }
+        .atpu-detail-backdrop {
+            position: fixed;
+            inset: 0;
+            z-index: 1000001;
+            background: rgba(0,0,0,0.42);
+            display: none;
+        }
+        .atpu-detail-backdrop.atpu-open {
+            display: block;
+        }
+        .atpu-detail-card {
+            position: fixed;
+            left: 50%;
+            top: 50%;
+            transform: translate(-50%, -50%);
+            width: min(320px, calc(100vw - 22px));
+            background: linear-gradient(180deg, rgba(15,23,42,0.98), rgba(9,14,24,0.98));
+            color: #fff;
+            border-radius: 16px;
+            border: 1px solid rgba(255,255,255,0.10);
+            box-shadow: 0 18px 40px rgba(0,0,0,0.40);
+            padding: 14px;
+            font-family: system-ui, sans-serif;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 180ms ease, transform 220ms ease;
+        }
+        .atpu-detail-backdrop.atpu-open .atpu-detail-card {
+            opacity: 1;
+            pointer-events: auto;
+            transform: translate(-50%, -50%) scale(1);
+        }
+        .atpu-detail-card.atpu-detail-from-flip {
+            transform: translate(-50%, -50%) rotateY(0deg) scale(1);
+            animation: atpuDetailFlipIn 260ms ease;
+        }
+        @keyframes atpuDetailFlipIn {
+            0% { opacity: 0; transform: translate(-50%, -50%) rotateY(-90deg) scale(0.96); }
+            100% { opacity: 1; transform: translate(-50%, -50%) rotateY(0deg) scale(1); }
+        }
+        .atpu-detail-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 12px;
+        }
+        .atpu-detail-title {
+            font-size: 14px;
+            font-weight: 800;
+            display: flex;
+            flex-direction: column;
+            gap: 3px;
+            min-width: 0;
+        }
+        .atpu-detail-title strong {
+            font-size: 15px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .atpu-detail-badge {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 4px 8px;
+            border-radius: 999px;
+            font-size: 10px;
+            font-weight: 800;
+            border: 1px solid rgba(255,255,255,0.14);
+            background: rgba(255,255,255,0.06);
+        }
+        .atpu-detail-close {
+            width: 28px;
+            height: 28px;
+            border-radius: 999px;
+            border: 1px solid rgba(255,255,255,0.10);
+            background: rgba(255,255,255,0.06);
+            color: #fff;
+            font-size: 18px;
+            line-height: 1;
+            cursor: pointer;
+        }
+        .atpu-detail-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 8px;
+        }
+        .atpu-detail-item {
+            padding: 9px 10px;
+            border-radius: 12px;
+            background: rgba(255,255,255,0.04);
+            border: 1px solid rgba(255,255,255,0.06);
+        }
+        .atpu-detail-label {
+            display: block;
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: #94a3b8;
+            margin-bottom: 4px;
+        }
+        .atpu-detail-value {
+            display: block;
+            font-size: 13px;
+            font-weight: 700;
+            color: #fff;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .atpu-detail-foot {
+            margin-top: 10px;
+            color: #94a3b8;
+            font-size: 11px;
+            line-height: 1.3;
+        }
+    `;
 
-        hud.style.display = STATE.hudVisible ? "block" : "none";
+    document.head.appendChild(style);
+}
+
+function getHudState(playerId) {
+    const key = String(playerId);
+    if (!HUD_STATE[key]) {
+        HUD_STATE[key] = {
+            fadeTimer: null,
+            clickTimer: null,
+            lastSignature: null,
+            hudEl: null,
+            boxEl: null,
+            isFaded: false,
+            lastTapAt: 0,
+            suppressClickUntil: 0
+        };
+    }
+    return HUD_STATE[key];
+}
+
+function clearHudTimers(playerId) {
+    const st = HUD_STATE[String(playerId)];
+    if (!st) return;
+    if (st.fadeTimer) {
+        clearTimeout(st.fadeTimer);
+        st.fadeTimer = null;
+    }
+    if (st.clickTimer) {
+        clearTimeout(st.clickTimer);
+        st.clickTimer = null;
+    }
+}
+
+function removeHud(playerId) {
+    const key = String(playerId);
+    const st = HUD_STATE[key];
+    if (!st) return;
+    clearHudTimers(key);
+    if (st.hudEl && st.hudEl.parentNode) st.hudEl.parentNode.removeChild(st.hudEl);
+    delete HUD_STATE[key];
+    if (DETAIL_CARD_STATE.activePlayerId === key) closeDetailCard();
+}
+
+function cleanupStaleHud(validPlayerIds) {
+    const keep = new Set((validPlayerIds || []).map(v => String(v)));
+    Object.keys(HUD_STATE).forEach(id => {
+        const st = HUD_STATE[id];
+        const hudEl = st && st.hudEl;
+        const hudInDom = !!(hudEl && hudEl.isConnected);
+        const box = document.getElementById("player-" + id);
+        if (!keep.has(id) || !hudInDom || !box) removeHud(id);
+    });
+}
+
+function scheduleHudFade(playerId, shouldStartTimer) {
+    const st = getHudState(playerId);
+    const hud = st.hudEl;
+    if (!hud) return;
+
+    if (st.fadeTimer) clearTimeout(st.fadeTimer);
+    st.fadeTimer = null;
+
+    hud.classList.remove("atpu-mini-faded");
+    hud.classList.add("atpu-mini-active");
+    st.isFaded = false;
+
+    if (shouldStartTimer === false) return;
+
+    st.fadeTimer = setTimeout(() => {
+        const current = HUD_STATE[String(playerId)];
+        if (!current || !current.hudEl) return;
+        current.hudEl.classList.add("atpu-mini-faded");
+        current.hudEl.classList.remove("atpu-mini-active");
+        current.isFaded = true;
+        current.fadeTimer = null;
+    }, 6000);
+}
+
+function pulseMiniHud(playerId) {
+    const st = getHudState(playerId);
+    if (!st.hudEl) return;
+    st.hudEl.classList.remove("atpu-mini-flip");
+    void st.hudEl.offsetWidth;
+    st.hudEl.classList.add("atpu-mini-flip");
+    setTimeout(() => {
+        const current = HUD_STATE[String(playerId)];
+        if (current && current.hudEl) current.hudEl.classList.remove("atpu-mini-flip");
+    }, 460);
+}
+
+function buildDetailMetric(label, value) {
+    return `<div class="atpu-detail-item"><span class="atpu-detail-label">${label}</span><span class="atpu-detail-value">${value}</span></div>`;
+}
+
+function ensureDetailCardMounted() {
+    ensureHudStyles();
+    if (DETAIL_CARD_STATE.mounted && DETAIL_CARD_STATE.backdrop && DETAIL_CARD_STATE.card) return;
+
+    const backdrop = document.createElement("div");
+    backdrop.className = "atpu-detail-backdrop";
+
+    const card = document.createElement("div");
+    card.className = "atpu-detail-card";
+    backdrop.appendChild(card);
+
+    backdrop.addEventListener("click", e => {
+        if (e.target === backdrop) closeDetailCard();
+    });
+
+    document.body.appendChild(backdrop);
+
+    DETAIL_CARD_STATE.mounted = true;
+    DETAIL_CARD_STATE.backdrop = backdrop;
+    DETAIL_CARD_STATE.card = card;
+}
+
+function closeDetailCard() {
+    if (!DETAIL_CARD_STATE.mounted || !DETAIL_CARD_STATE.backdrop || !DETAIL_CARD_STATE.card) return;
+    DETAIL_CARD_STATE.backdrop.classList.remove("atpu-open");
+    DETAIL_CARD_STATE.backdrop.style.display = "none";
+    DETAIL_CARD_STATE.card.classList.remove("atpu-detail-from-flip");
+    DETAIL_CARD_STATE.activePlayerId = null;
+}
+
+function openDetailCard(playerId, preferFlip) {
+    const id = String(playerId);
+    const stats = PLAYER_STATS[id];
+    const table = ensureTable(STATE.activeTableId || "");
+    const livePlayer = table && table.playersById ? table.playersById[id] : null;
+    if (!stats || !livePlayer) return;
+
+    ensureDetailCardMounted();
+
+    const vpip = stats.hands ? (stats.vpipHands / stats.hands * 100) : 0;
+    const pfr = stats.hands ? (stats.pfrHands / stats.hands * 100) : 0;
+    const style = getStyle(vpip, pfr, stats.hands);
+    const stack = livePlayer && livePlayer.stack != null ? "$" + formatMoneyShort(livePlayer.stack) : "-";
+    const status = livePlayer && livePlayer.status ? livePlayer.status : "-";
+    const seat = livePlayer && livePlayer.seat ? livePlayer.seat : "-";
+
+    DETAIL_CARD_STATE.card.innerHTML = `
+        <div class="atpu-detail-head">
+            <div class="atpu-detail-title">
+                <strong>${stats.name || ("ID " + id)}</strong>
+                <span class="atpu-detail-badge" style="color:${style.c};">${style.l}</span>
+            </div>
+            <button class="atpu-detail-close" type="button" aria-label="Close">×</button>
+        </div>
+        <div class="atpu-detail-grid">
+            ${buildDetailMetric("Hands", String(stats.hands || 0))}
+            ${buildDetailMetric("VPIP", `${vpip.toFixed(0)}%`)}
+            ${buildDetailMetric("PFR", `${pfr.toFixed(0)}%`)}
+            ${buildDetailMetric("Stack", stack)}
+            ${buildDetailMetric("Status", status)}
+            ${buildDetailMetric("Seat", String(seat))}
+            ${buildDetailMetric("Player ID", id)}
+            ${buildDetailMetric("Table", String(STATE.activeTableId || "-"))}
+        </div>
+        <div class="atpu-detail-foot">Tap singolo: riattiva badge. Doppio tap: scheda completa del player.</div>
+    `;
+
+    const closeBtn = DETAIL_CARD_STATE.card.querySelector(".atpu-detail-close");
+    if (closeBtn) closeBtn.onclick = closeDetailCard;
+
+    DETAIL_CARD_STATE.activePlayerId = id;
+    DETAIL_CARD_STATE.lastOpenAt = Date.now();
+
+    DETAIL_CARD_STATE.backdrop.style.display = "block";
+    DETAIL_CARD_STATE.backdrop.classList.add("atpu-open");
+
+    DETAIL_CARD_STATE.card.classList.remove("atpu-detail-from-flip");
+    if (preferFlip && !isTouchLikeDevice()) {
+        void DETAIL_CARD_STATE.card.offsetWidth;
+        DETAIL_CARD_STATE.card.classList.add("atpu-detail-from-flip");
+    }
+}
+
+function bindMiniHudEvents(playerId) {
+    const st = getHudState(playerId);
+    const hud = st.hudEl;
+    if (!hud || hud.dataset.bound === "1") return;
+
+    hud.dataset.bound = "1";
+
+    const DOUBLE_TAP_MS = 320;
+    const SINGLE_TAP_DELAY = 260;
+
+    function handleTapLike(e) {
         if (!STATE.hudVisible) return;
 
-        const vpip = s.hands ? (s.vpipHands / s.hands * 100) : 0;
-        const pfr = s.hands ? (s.pfrHands / s.hands * 100) : 0;
-        const st = getStyle(vpip, pfr, s.hands);
+        e.preventDefault();
+        e.stopPropagation();
 
-        hud.innerHTML =
-            `<div style="font-weight:700;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${s.name}</div>` +
-            `<div style="color:${st.c};font-weight:700;margin-top:1px;">${st.l}</div>` +
-            `<div style="margin-top:1px;">${vpip.toFixed(0)} / ${pfr.toFixed(0)}</div>` +
-            `<div>H:${s.hands}</div>` +
-            `<div style="margin-top:1px;color:#d1d5db;">$${formatMoneyShort(liveStack)}</div>`;
+        const current = getHudState(playerId);
+        const now = Date.now();
+
+        if (current.clickTimer && (now - current.lastTapAt) <= DOUBLE_TAP_MS) {
+            clearTimeout(current.clickTimer);
+            current.clickTimer = null;
+            current.lastTapAt = 0;
+            current.suppressClickUntil = now + 500;
+
+            pulseMiniHud(playerId);
+            openDetailCard(playerId, true);
+            scheduleHudFade(playerId, true);
+            return;
+        }
+
+        current.lastTapAt = now;
+
+        if (current.clickTimer) {
+            clearTimeout(current.clickTimer);
+            current.clickTimer = null;
+        }
+
+        current.clickTimer = setTimeout(() => {
+            const latest = getHudState(playerId);
+            latest.clickTimer = null;
+            scheduleHudFade(playerId, true);
+        }, SINGLE_TAP_DELAY);
+    }
+
+    function handleClickFallback(e) {
+        const current = getHudState(playerId);
+        if (Date.now() < current.suppressClickUntil) {
+            e.preventDefault();
+            e.stopPropagation();
+            return;
+        }
+        handleTapLike(e);
+    }
+
+    if ("PointerEvent" in globalWindow) {
+        hud.addEventListener("pointerup", handleTapLike, { passive: false });
+        hud.addEventListener("click", handleClickFallback, { passive: false });
+    } else {
+        hud.addEventListener("touchend", handleTapLike, { passive: false });
+        hud.addEventListener("click", handleClickFallback, { passive: false });
+    }
+}
+
+function getPlayerHudSignature(stats, livePlayer) {
+    const vpip = stats.hands ? (stats.vpipHands / stats.hands * 100) : 0;
+    const pfr = stats.hands ? (stats.pfrHands / stats.hands * 100) : 0;
+    const style = getStyle(vpip, pfr, stats.hands);
+    return [
+        style.l,
+        stats.hands || 0,
+        vpip.toFixed(0),
+        pfr.toFixed(0),
+        livePlayer && livePlayer.stack != null ? livePlayer.stack : "-",
+        livePlayer && livePlayer.status ? livePlayer.status : "-"
+    ].join("|");
+}
+
+function renderMiniHudForPlayer(box, playerId, stats, livePlayer) {
+    ensureHudStyles();
+
+    const st = getHudState(playerId);
+    st.boxEl = box;
+
+    let hud = st.hudEl;
+    if (!hud || !hud.isConnected || hud.parentNode !== box) {
+        if (hud && hud.parentNode) hud.parentNode.removeChild(hud);
+        hud = document.createElement("div");
+        hud.className = "atpu-mini-hud atpu-mini-active";
+        hud.setAttribute("data-player-id", String(playerId));
+        st.hudEl = hud;
+        if (getComputedStyle(box).position === "static") box.style.position = "relative";
+        box.appendChild(hud);
+        bindMiniHudEvents(playerId);
+        st.lastSignature = null;
+    }
+
+    const vpip = stats.hands ? (stats.vpipHands / stats.hands * 100) : 0;
+    const pfr = stats.hands ? (stats.pfrHands / stats.hands * 100) : 0;
+    const style = getStyle(vpip, pfr, stats.hands);
+    const signature = getPlayerHudSignature(stats, livePlayer);
+
+    hud.style.display = STATE.hudVisible ? "block" : "none";
+    if (!STATE.hudVisible) return;
+
+    hud.style.color = style.c;
+    hud.textContent = style.l;
+    hud.title = `${stats.name || ("ID " + playerId)} • ${style.l}`;
+
+    if (st.lastSignature !== signature) {
+        st.lastSignature = signature;
+        scheduleHudFade(playerId, true);
+        if (DETAIL_CARD_STATE.activePlayerId === String(playerId) && DETAIL_CARD_STATE.backdrop && DETAIL_CARD_STATE.backdrop.classList.contains("atpu-open")) {
+            openDetailCard(playerId, false);
+        }
+    } else if (st.isFaded) {
+        hud.classList.add("atpu-mini-faded");
+        hud.classList.remove("atpu-mini-active");
+    }
+}
+
+function renderHUD() {
+    ensureHudStyles();
+
+    const activeTableKey = String(STATE.activeTableId || "");
+    const currentTable = STATE.tables[activeTableKey] || null;
+    const validPlayerIds = [];
+
+    document.querySelectorAll("[id^='player-']").forEach(box => {
+        const id = box.id.replace("player-", "");
+        const stats = PLAYER_STATS[id];
+        if (!stats) return;
+
+        const livePlayer = currentTable && currentTable.playersById ? currentTable.playersById[id] : null;
+        if (!livePlayer) {
+            removeHud(id);
+            return;
+        }
+
+        validPlayerIds.push(id);
+        renderMiniHudForPlayer(box, id, stats, livePlayer);
     });
+
+    cleanupStaleHud(validPlayerIds);
 }
 
 function detectActions(tableId, table, oldPlayers, msg) {
@@ -447,9 +995,18 @@ function detectActions(tableId, table, oldPlayers, msg) {
         const type = mapStatusToType(newStatus);
         if (!type) return;
 
-        const dedupeKey = `${tableId}_${player.id}_${type}_${table.currentHandId || "nohand"}`;
+        const dedupeKey = `${tableId}_${player.id}_${type}_${table.currentHandId || "nohand"}_${table.currentStreet || "nostreet"}`;
         if (LAST_ACTION[dedupeKey]) return;
         LAST_ACTION[dedupeKey] = true;
+
+        table.actionIndex = Number(table.actionIndex || 0) + 1;
+
+        const isAggressor = type === "raise" || type === "bet" || type === "allin";
+        if (isAggressor) {
+            table.lastAggressorId = String(player.id);
+        }
+
+        const handResult = inferHandResult(type, newStatus);
 
         queue(tableId, {
             type,
@@ -458,7 +1015,11 @@ function detectActions(tableId, table, oldPlayers, msg) {
             amount: msg.amountCall || null,
             stack_before: prev.stack,
             stack_after: player.stack,
-            hand_id: table.currentHandId || null
+            hand_id: table.currentHandId || null,
+            street: table.currentStreet || "preflop",
+            action_index: table.actionIndex,
+            is_aggressor: isAggressor,
+            hand_result: handResult
         });
     });
 }
@@ -471,7 +1032,7 @@ function updatePlayersFromState(tableId, msg) {
         oldPlayers[id] = { ...row };
     });
 
-    table.currentHandId = String(msg.token || msg.gameToken || msg.handId || msg.hand_id || table.currentHandId || "");
+    syncTableHandContext(table, msg);
 
     const fresh = {};
     Object.entries(msg.players || {}).forEach(([seat, p]) => {
@@ -501,6 +1062,8 @@ function updateFromUpdatePlayer(tableId, msg) {
         oldPlayers[id] = { ...row };
     });
 
+    syncTableHandContext(table, msg);
+
     const playersObj = msg.player || msg.players || {};
     Object.entries(playersObj).forEach(([seat, p]) => {
         if (!p || !p.userID) return;
@@ -517,7 +1080,6 @@ function updateFromUpdatePlayer(tableId, msg) {
         ensurePlayerStats(uid, name);
     });
 
-    table.currentHandId = String(msg.token || msg.gameToken || msg.handId || msg.hand_id || table.currentHandId || "");
     detectActions(tableId, table, oldPlayers, msg);
 }
 
@@ -638,6 +1200,7 @@ function renderMenuStatus() {
 
 function setHudVisible(value) {
     saveHudVisible(value);
+    if (!STATE.hudVisible) closeDetailCard();
     renderHUD();
     renderMenuStatus();
 
@@ -817,6 +1380,7 @@ function boot() {
     loadHudVisible();
 
     waitForBody(() => {
+        ensureHudStyles();
         mountButton();
         autoAuthorizeFromLocalKey();
 
