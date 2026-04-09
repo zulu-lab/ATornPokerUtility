@@ -964,32 +964,44 @@ function openDetailCard(playerId, preferFlip) {
 
     ensureDetailCardMounted();
 
-    const vpip = stats.hands ? (stats.vpipHands / stats.hands * 100) : 0;
-    const pfr = stats.hands ? (stats.pfrHands / stats.hands * 100) : 0;
-    const style = getStyle(vpip, pfr, stats.hands);
-    const stack = livePlayer && livePlayer.stack != null ? "$" + formatMoneyShort(livePlayer.stack) : "-";
-    const status = livePlayer && livePlayer.status ? livePlayer.status : "-";
-    const seat = livePlayer && livePlayer.seat ? livePlayer.seat : "-";
+    const hands = stats.hands || 0;
+    const vpip = hands ? (stats.vpipHands / hands * 100) : 0;
+    const pfr = hands ? (stats.pfrHands / hands * 100) : 0;
+
+    const raw = stats.raw || {};
+
+    const af = raw.af ?? raw.aggression ?? "-";
+    const threebet = raw.threebet ?? raw["3bet"] ?? "-";
+    const cbet = raw.cbet_flop ?? "-";
+    const wtsd = raw.wtsd ?? "-";
+    const wsd = raw.wsd ?? "-";
+
+    const style = getStyle(vpip, pfr, hands);
 
     DETAIL_CARD_STATE.card.innerHTML = `
         <div class="atpu-detail-head">
             <div class="atpu-detail-title">
-                <strong>${stats.name || ("ID " + id)}</strong>
-                <span class="atpu-detail-badge" style="color:${style.c};">${style.l}</span>
+                <strong>
+                    ${stats.name || ("ID " + id)}
+                    <span style="margin-left:6px;color:${style.c};font-size:11px;">${style.l}</span>
+                </strong>
             </div>
-            <button class="atpu-detail-close" type="button" aria-label="Close">×</button>
+            <button class="atpu-detail-close" type="button">×</button>
         </div>
+
         <div class="atpu-detail-grid">
-            ${buildDetailMetric("Hands", String(stats.hands || 0))}
-            ${buildDetailMetric("VPIP", `${vpip.toFixed(0)}%`)}
-            ${buildDetailMetric("PFR", `${pfr.toFixed(0)}%`)}
-            ${buildDetailMetric("Stack", stack)}
-            ${buildDetailMetric("Status", status)}
-            ${buildDetailMetric("Seat", String(seat))}
-            ${buildDetailMetric("Player ID", id)}
-            ${buildDetailMetric("Table", String(STATE.activeTableId || "-"))}
+            ${buildDetailMetric("HANDS", hands)}
+            ${buildDetailMetric("VPIP", vpip.toFixed(0) + "%")}
+            ${buildDetailMetric("PFR", pfr.toFixed(0) + "%")}
+
+            ${buildDetailMetric("AF", af)}
+            ${buildDetailMetric("3B", threebet)}
+            ${buildDetailMetric("CBET", cbet)}
+
+            ${buildDetailMetric("WTSD", wtsd)}
+            ${buildDetailMetric("WSD", wsd)}
+            ${buildDetailMetric("STACK", livePlayer.stack ? "$" + formatMoneyShort(livePlayer.stack) : "-")}
         </div>
-        <div class="atpu-detail-foot">Tap singolo: riattiva badge. Doppio tap: scheda completa del player.</div>
     `;
 
     const closeBtn = DETAIL_CARD_STATE.card.querySelector(".atpu-detail-close");
