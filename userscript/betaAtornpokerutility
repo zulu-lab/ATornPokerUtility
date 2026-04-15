@@ -1791,6 +1791,8 @@ function emitSawFlopIfNeeded(tableId, boardCards) {
 }
 
 function maybeEmitPreflopAdvanced(tableId, table, player, prev, type, commonMeta) {
+    if ((table.currentStreet || "preflop") !== "preflop") return;
+
     const playerId = String(player.id);
     const handKey = table.currentHandId || "nohand";
 
