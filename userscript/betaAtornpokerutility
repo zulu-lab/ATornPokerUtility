@@ -1838,7 +1838,17 @@ function maybeEmitPreflopAdvanced(tableId, table, player, prev, type, commonMeta
         }
     }
 
-    const isBbSeat = String(player.seat || "").toLowerCase() === "bb";
+    const playerSeat = String(player.seat ?? "");
+    const activePlayers = Object.values(table.playersById)
+        .filter(p => !p.folded && !isExcludedStatus(p.status));
+
+    const sortedSeats = activePlayers
+        .map(p => String(p.seat ?? ""))
+        .filter(Boolean)
+        .sort((a, b) => Number(a) - Number(b));
+
+    const bbSeat = sortedSeats.length ? sortedSeats[sortedSeats.length - 1] : null;
+    const isBbSeat = bbSeat !== null && playerSeat === bbSeat;
     const isLateStealPressure = hasPriorRaise;
 
     if (isBbSeat && isLateStealPressure) {
@@ -1874,7 +1884,6 @@ function maybeEmitPreflopAdvanced(tableId, table, player, prev, type, commonMeta
         }
     }
 }
-
 function maybeEmitFlopAdvanced(tableId, table, player, type, commonMeta) {
     const playerId = String(player.id);
     const handKey = table.currentHandId || "nohand";
