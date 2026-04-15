@@ -1999,7 +1999,8 @@ function detectActions(tableId, table, oldPlayers, msg) {
         if (!type) return;
 
         if (table.currentStreet === "preflop" && type === "call") type = "call_preflop";
-        if (table.currentStreet === "preflop" && type === "raise") type = "raise_preflop";
+if (table.currentStreet === "preflop" && type === "raise") type = "raise_preflop";
+if (table.currentStreet === "preflop" && type === "bet") type = "raise_preflop";
 
         const nextActionIndex = Number(table.actionIndex || 0) + 1;
         const dedupeKey = `${tableId}_${player.id}_${type}_${table.currentHandId || "nohand"}_${table.currentStreet || "nostreet"}_${nextActionIndex}`;
