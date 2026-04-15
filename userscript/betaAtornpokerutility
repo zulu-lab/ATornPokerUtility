@@ -479,6 +479,16 @@ function extractBoardCards(msg) {
     return [];
 }
 
+function getStreetRank(street) {
+    switch (String(street || "").toLowerCase()) {
+        case "preflop": return 0;
+        case "flop": return 1;
+        case "turn": return 2;
+        case "river": return 3;
+        default: return -1;
+    }
+}
+
 function inferStreetFromMessage(msg, fallbackStreet) {
     const boardCards = extractBoardCards(msg);
     const boardCount = boardCards.length;
@@ -486,11 +496,9 @@ function inferStreetFromMessage(msg, fallbackStreet) {
     if (boardCount >= 5) return "river";
     if (boardCount === 4) return "turn";
     if (boardCount === 3) return "flop";
-    if (boardCount === 0) return "preflop";
 
     return fallbackStreet || "preflop";
 }
-
 function cloneLightPlayers(playersById) {
     return Object.values(playersById || {}).map(p => ({
         id: p.id,
@@ -515,13 +523,18 @@ function syncTableHandContext(table, msg) {
     const previousStreet = table.currentStreet || "preflop";
     const inferredStreet = inferStreetFromMessage(msg, previousStreet);
 
-    if (inferredStreet !== previousStreet) {
-        table.currentStreet = inferredStreet;
+    const previousRank = getStreetRank(previousStreet);
+    const inferredRank = getStreetRank(inferredStreet);
+
+    const finalStreet = inferredRank >= previousRank ? inferredStreet : previousStreet;
+
+    if (finalStreet !== previousStreet) {
+        table.currentStreet = finalStreet;
         table.streetActionIndex = 0;
         table.streetBetCount = 0;
         table.playerCheckedStreet = {};
     } else {
-        table.currentStreet = inferredStreet;
+        table.currentStreet = finalStreet;
     }
 }
 
