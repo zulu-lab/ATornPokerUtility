@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ATornPokerUtility
 // @namespace    zulu.atornpoker.utility
-// @version      5.0.1
-// @description  Torn Poker HUD with whitelist auth and server stats (PDA compatible)
+// @version      5.1.7
+// @description  Torn Poker HUD with whitelist auth, global server stats and stable player detail notes (PDA compatible)
 // @match        https://www.torn.com/page.php?sid=holdem*
 // @match        https://www.torn.com/pda.php?sid=holdem*
 // @match        https://www.torn.com/loader.php?sid=holdem*
@@ -25,7 +25,7 @@ if (globalWindow.__A_TPU__) return;
 globalWindow.__A_TPU__ = true;
 
 const SERVER = "https://torn-poker-server-production.up.railway.app";
-const SCRIPT_VERSION = "5.0.1";
+const SCRIPT_VERSION = "5.1.7";
 
 const LS = {
     token: "atpu.publicToken",
@@ -33,6 +33,13 @@ const LS = {
     tornApiKey: "atpu.tornApiKey",
     hudVisible: "atpu.hudVisible"
 };
+
+const COLOR_PRESETS = [
+    "#22c55e",
+    "#60a5fa",
+    "#f59e0b",
+    "#ef4444"
+];
 
 const ALLOWED_TYPES = new Set([
     "join",
@@ -70,6 +77,22 @@ const ALLOWED_TYPES = new Set([
     "faced_steal_bb"
 ]);
 
+const SNAPSHOT_EVENT_TYPES = new Set([
+    "hand_dealt",
+    "saw_flop",
+    "showdown",
+    "win_showdown"
+]);
+
+const BOARD_EVENT_TYPES = new Set([
+    "saw_flop",
+    "showdown",
+    "win_showdown",
+    "cbet_flop",
+    "donk_bet",
+    "check_raise"
+]);
+
 const STATE = {
     sessionId: null,
     sessionStarting: false,
@@ -86,6 +109,8 @@ const STATE = {
 };
 
 const PLAYER_STATS = {};
+const PLAYER_NOTES = {};
+const NOTE_REQUESTS = {};
 const LAST_ACTION = {};
 const HUD_STATE = {};
 const DETAIL_CARD_STATE = {
@@ -93,7 +118,9 @@ const DETAIL_CARD_STATE = {
     card: null,
     backdrop: null,
     activePlayerId: null,
-    lastOpenAt: 0
+    lastOpenAt: 0,
+    drafts: {},
+    lastFlashMessage: ""
 };
 
 function req(method, url, headers, body, cb) {
@@ -128,6 +155,77 @@ function safeNumber(value) {
 
 function isPageActive() {
     return !document.hidden && document.hasFocus();
+}
+
+function escapeHtml(value) {
+    return String(value == null ? "" : value)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+}
+
+function normalizeStatusText(value) {
+    return String(value || "").toLowerCase().trim();
+}
+
+function isExcludedStatus(value) {
+    const s = normalizeStatusText(value);
+    if (!s) return false;
+    if (s.includes("sitting out")) return true;
+    if (s.includes("waiting bb")) return true;
+    if (s.includes("waiting sb")) return true;
+    if (s === "waiting") return true;
+    return false;
+}
+
+function isBlindOrDealerStatus(value) {
+    const s = normalizeStatusText(value);
+    return s.includes("big blind") || s.includes("small blind") || s.includes("dealer");
+}
+
+function sanitizePreviousStatus(rawStatus, street) {
+    if (rawStatus == null) return null;
+
+    const text = String(rawStatus).trim();
+    if (!text) return null;
+
+    const lower = text.toLowerCase();
+
+    const uiNoise = new Set([
+        "big blind",
+        "small blind",
+        "dealer",
+        "waiting bb",
+        "waiting sb",
+        "sitting out",
+        "active"
+    ]);
+
+    if (uiNoise.has(lower)) return null;
+
+    if (street !== "preflop") {
+        if (
+            lower.includes("blind") ||
+            lower.includes("dealer") ||
+            lower === "active"
+        ) {
+            return null;
+        }
+    }
+
+    return text;
+}
+
+function shouldIncludePlayersSnapshot(eventType) {
+    return SNAPSHOT_EVENT_TYPES.has(String(eventType || "").toLowerCase());
+}
+
+function shouldIncludeBoardCards(eventType, street, boardCards) {
+    if (!Array.isArray(boardCards) || !boardCards.length) return false;
+    if (String(street || "").toLowerCase() === "preflop") return false;
+    return BOARD_EVENT_TYPES.has(String(eventType || "").toLowerCase());
 }
 
 function saveAuthState() {
@@ -198,6 +296,8 @@ function ensureTable(tableId) {
             streetActionIndex: 0,
             lastAggressorId: null,
             preflopAggressorId: null,
+            preflopLastRaiseActorId: null,
+            preflopLastRaiseActionIndex: 0,
             flopCbetterId: null,
             preflopRaiseCount: 0,
             streetBetCount: 0,
@@ -232,6 +332,8 @@ function resetHandState(table, newHandId) {
     table.streetActionIndex = 0;
     table.lastAggressorId = null;
     table.preflopAggressorId = null;
+    table.preflopLastRaiseActorId = null;
+    table.preflopLastRaiseActionIndex = 0;
     table.flopCbetterId = null;
     table.preflopRaiseCount = 0;
     table.streetBetCount = 0;
@@ -263,12 +365,89 @@ function ensurePlayerStats(userId, name) {
             name: name || ("ID " + id),
             hands: 0,
             vpipHands: 0,
-            pfrHands: 0
+            pfrHands: 0,
+            raw: {}
         };
     } else if (name) {
         PLAYER_STATS[id].name = name;
     }
     return PLAYER_STATS[id];
+}
+
+function ensurePlayerNote(userId) {
+    const id = String(userId);
+    if (!PLAYER_NOTES[id]) {
+        PLAYER_NOTES[id] = {
+            note_text: "",
+            tag_text: "",
+            color_text: "",
+            loaded: false,
+            loading: false,
+            error: false,
+            updated_at: null
+        };
+    }
+    return PLAYER_NOTES[id];
+}
+
+function getDetailDraft(playerId) {
+    const id = String(playerId);
+    if (!DETAIL_CARD_STATE.drafts[id]) {
+        DETAIL_CARD_STATE.drafts[id] = {
+            tag_text: "",
+            color_text: "",
+            note_text: "",
+            dirty: false
+        };
+    }
+    return DETAIL_CARD_STATE.drafts[id];
+}
+
+function syncDraftFromNote(playerId, forceOverwrite) {
+    const note = ensurePlayerNote(playerId);
+    const draft = getDetailDraft(playerId);
+    if (draft.dirty && !forceOverwrite) return;
+
+    draft.tag_text = note.tag_text || "";
+    draft.color_text = note.color_text || "";
+    draft.note_text = note.note_text || "";
+    draft.dirty = false;
+}
+
+function captureDetailDraftFromDom() {
+    const playerId = DETAIL_CARD_STATE.activePlayerId;
+    if (!playerId || !DETAIL_CARD_STATE.card) return;
+
+    const tagInput = DETAIL_CARD_STATE.card.querySelector("#atpu-detail-tag");
+    const noteInput = DETAIL_CARD_STATE.card.querySelector("#atpu-detail-note");
+    const colorHidden = DETAIL_CARD_STATE.card.querySelector("#atpu-detail-color-hidden");
+    if (!tagInput || !noteInput || !colorHidden) return;
+
+    const draft = getDetailDraft(playerId);
+    draft.tag_text = String(tagInput.value || "").slice(0, 32);
+    draft.note_text = String(noteInput.value || "").slice(0, 150);
+    draft.color_text = String(colorHidden.value || "");
+}
+
+function isEditingCurrentDetailCard() {
+    const playerId = DETAIL_CARD_STATE.activePlayerId;
+    if (!playerId || !DETAIL_CARD_STATE.card) return false;
+
+    const active = document.activeElement;
+    if (!active) return false;
+
+    return DETAIL_CARD_STATE.card.contains(active) && (
+        active.id === "atpu-detail-tag" ||
+        active.id === "atpu-detail-note" ||
+        active.classList.contains("atpu-color-chip")
+    );
+}
+
+function safeRefreshActiveDetailCard(playerId, flashMessage, force) {
+    const id = String(playerId);
+    if (DETAIL_CARD_STATE.activePlayerId !== id) return;
+    if (!force && (isEditingCurrentDetailCard() || getDetailDraft(id).dirty)) return;
+    renderDetailCard(id, flashMessage);
 }
 
 function parseMoney(text) {
@@ -326,6 +505,16 @@ function extractBoardCards(msg) {
     return [];
 }
 
+function getStreetRank(street) {
+    switch (String(street || "").toLowerCase()) {
+        case "preflop": return 0;
+        case "flop": return 1;
+        case "turn": return 2;
+        case "river": return 3;
+        default: return -1;
+    }
+}
+
 function inferStreetFromMessage(msg, fallbackStreet) {
     const boardCards = extractBoardCards(msg);
     const boardCount = boardCards.length;
@@ -333,7 +522,6 @@ function inferStreetFromMessage(msg, fallbackStreet) {
     if (boardCount >= 5) return "river";
     if (boardCount === 4) return "turn";
     if (boardCount === 3) return "flop";
-    if (boardCount === 0) return "preflop";
 
     return fallbackStreet || "preflop";
 }
@@ -362,13 +550,18 @@ function syncTableHandContext(table, msg) {
     const previousStreet = table.currentStreet || "preflop";
     const inferredStreet = inferStreetFromMessage(msg, previousStreet);
 
-    if (inferredStreet !== previousStreet) {
-        table.currentStreet = inferredStreet;
+    const previousRank = getStreetRank(previousStreet);
+    const inferredRank = getStreetRank(inferredStreet);
+
+    const finalStreet = inferredRank >= previousRank ? inferredStreet : previousStreet;
+
+    if (finalStreet !== previousStreet) {
+        table.currentStreet = finalStreet;
         table.streetActionIndex = 0;
         table.streetBetCount = 0;
         table.playerCheckedStreet = {};
     } else {
-        table.currentStreet = inferredStreet;
+        table.currentStreet = finalStreet;
     }
 }
 
@@ -380,6 +573,79 @@ function inferHandResult(type, statusText) {
     if (s.includes("lost") || s.includes("lose") || s.includes("loses")) return "lose";
 
     return null;
+}
+
+function isEligibleForHandDealt(player) {
+    if (!player) return false;
+
+    const status = normalizeStatusText(player.status || "");
+
+    if (!status) return false;
+    if (status.includes("sitting out")) return false;
+    if (status.includes("waiting bb")) return false;
+    if (status.includes("waiting sb")) return false;
+    if (status === "waiting") return false;
+    if (status.includes("fold")) return false;
+
+    return true;
+}
+
+function hasRealParticipationBefore(prevStatus, player, table) {
+    const prevNorm = normalizeStatusText(prevStatus);
+    const currentNorm = normalizeStatusText(player?.status);
+    const playerId = String(player?.id || "");
+    const street = table?.currentStreet || "preflop";
+
+    if (!playerId) return false;
+
+    if (prevNorm === "call" || prevNorm === "check" || prevNorm === "bet" || prevNorm === "raise" || prevNorm === "all in") return true;
+    if (currentNorm === "call" || currentNorm === "check" || currentNorm === "bet" || currentNorm === "raise" || currentNorm === "all in") return true;
+
+    if (table?.sawFlopEmitted?.[playerId]) return true;
+    if (table?.showdownEmitted?.[playerId]) return true;
+    if (table?.winShowdownEmitted?.[playerId]) return true;
+
+    if (street !== "preflop" && isBlindOrDealerStatus(prevNorm)) return true;
+
+    return false;
+}
+
+function shouldIgnoreTransition(oldStatus, newStatus, player, table) {
+    const oldNorm = normalizeStatusText(oldStatus);
+    const newNorm = normalizeStatusText(newStatus);
+
+    if (!oldNorm || !newNorm || oldNorm === newNorm) return true;
+
+    const oldIsFold = oldNorm.includes("fold");
+    const newIsFold = newNorm.includes("fold");
+
+    if (oldIsFold && newIsFold) {
+        return true;
+    }
+
+    if (isExcludedStatus(oldNorm)) {
+        if (
+            newNorm.includes("fold") ||
+            newNorm.includes("check") ||
+            newNorm.includes("call") ||
+            newNorm.includes("raise") ||
+            newNorm === "bet" ||
+            newNorm.includes(" bet") ||
+            newNorm.includes("all in") ||
+            newNorm.includes("winner") ||
+            newNorm.includes("won") ||
+            newNorm.includes("wins") ||
+            newNorm.includes("collected")
+        ) {
+            return true;
+        }
+    }
+
+    if (newIsFold && !hasRealParticipationBefore(oldNorm, player, table)) {
+        return true;
+    }
+
+    return false;
 }
 
 function resetTableSession(newTableId) {
@@ -475,7 +741,7 @@ function flush() {
     if (!isPageActive()) return;
     if (!STATE.sessionId || !STATE.eventQueue.length) return;
 
-    const batch = STATE.eventQueue.splice(0, 50);
+    const batch = STATE.eventQueue.splice(0, 100);
 
     api("/api/public/events", "POST", {
         session_id: STATE.sessionId,
@@ -521,10 +787,127 @@ function loadStatsFromServer() {
                 pfrHands: (pfr / 100) * hands,
                 raw: row
             };
+
+            ensurePlayerNote(id);
         });
 
         renderHUD();
         renderMenuStatus();
+    });
+}
+
+function loadPlayerNote(playerId, forceReload, cb) {
+    const id = String(playerId || "");
+    if (!id) {
+        if (cb) cb(null);
+        return;
+    }
+
+    const note = ensurePlayerNote(id);
+
+    if (!STATE.authorized || !STATE.publicToken) {
+        if (cb) cb(note);
+        return;
+    }
+
+    if (!forceReload && note.loaded && !note.loading) {
+        if (cb) cb(note);
+        return;
+    }
+
+    if (note.loading) {
+        NOTE_REQUESTS[id] = NOTE_REQUESTS[id] || [];
+        if (cb) NOTE_REQUESTS[id].push(cb);
+        return;
+    }
+
+    note.loading = true;
+    note.error = false;
+    NOTE_REQUESTS[id] = NOTE_REQUESTS[id] || [];
+    if (cb) NOTE_REQUESTS[id].push(cb);
+
+    api(`/api/public/player-notes?torn_id=${encodeURIComponent(id)}`, "GET", null, (err, res) => {
+        const callbacks = NOTE_REQUESTS[id] || [];
+        NOTE_REQUESTS[id] = [];
+
+        note.loading = false;
+
+        if (err || res.status !== 200) {
+            note.error = true;
+            callbacks.forEach(fn => {
+                try { fn(note); } catch {}
+            });
+            safeRefreshActiveDetailCard(id, "Note request failed.", true);
+            return;
+        }
+
+        const data = safeParse(res.responseText, {});
+        const row = data.note || data || null;
+
+        note.note_text = row?.note_text || "";
+        note.tag_text = row?.tag_text || "";
+        note.color_text = row?.color_text || "";
+        note.updated_at = row?.updated_at || null;
+        note.loaded = true;
+        note.error = false;
+
+        syncDraftFromNote(id, !!forceReload);
+
+        callbacks.forEach(fn => {
+            try { fn(note); } catch {}
+        });
+
+        renderHUD();
+        safeRefreshActiveDetailCard(id, forceReload ? "Reloaded." : "", true);
+    });
+}
+
+function savePlayerNote(playerId, payload, cb) {
+    const id = String(playerId || "");
+    if (!id || !STATE.authorized || !STATE.publicToken) {
+        if (cb) cb(false);
+        return;
+    }
+
+    const note = ensurePlayerNote(id);
+    const draft = getDetailDraft(id);
+
+    draft.tag_text = String(payload.tag_text || "").slice(0, 32);
+    draft.color_text = String(payload.color_text || "");
+    draft.note_text = String(payload.note_text || "").slice(0, 150);
+    draft.dirty = true;
+
+    note.loading = true;
+    note.error = false;
+    safeRefreshActiveDetailCard(id, "Saving...", true);
+
+    api("/api/public/player-notes", "POST", {
+        torn_id: Number(id),
+        note_text: draft.note_text,
+        tag_text: draft.tag_text,
+        color_text: draft.color_text
+    }, (err, res) => {
+        note.loading = false;
+
+        if (err || res.status !== 200) {
+            note.error = true;
+            safeRefreshActiveDetailCard(id, "Save failed.", true);
+            if (cb) cb(false);
+            return;
+        }
+
+        note.note_text = draft.note_text;
+        note.tag_text = draft.tag_text;
+        note.color_text = draft.color_text;
+        note.loaded = true;
+        note.error = false;
+        note.updated_at = new Date().toISOString();
+
+        draft.dirty = false;
+
+        renderHUD();
+        safeRefreshActiveDetailCard(id, "Saved.", true);
+        if (cb) cb(true);
     });
 }
 
@@ -554,13 +937,18 @@ function queue(tableId, ev) {
     if (!isPageActive()) return;
     if (!STATE.authorized) return;
     if (String(tableId) !== String(STATE.activeTableId)) return;
-    if (!ALLOWED_TYPES.has(String(ev.type || "").toLowerCase())) return;
+
+    const eventType = String(ev.type || "").toLowerCase();
+    if (!ALLOWED_TYPES.has(eventType)) return;
 
     const handRef = ev.hand_id || null;
     const metadata = ev.metadata && typeof ev.metadata === "object" ? { ...ev.metadata } : {};
+    const street = ev.street ?? metadata.street ?? null;
+    const includeSnapshot = shouldIncludePlayersSnapshot(eventType);
+    const includeBoard = shouldIncludeBoardCards(eventType, street, Array.isArray(ev.board_cards) ? ev.board_cards : metadata.board_cards);
 
     metadata.raw_hand_ref = handRef;
-    metadata.street = ev.street ?? metadata.street ?? null;
+    metadata.street = street;
     metadata.action_index = Number.isFinite(ev.action_index) ? ev.action_index : (Number.isFinite(metadata.action_index) ? metadata.action_index : null);
     metadata.is_aggressor = typeof ev.is_aggressor === "boolean" ? ev.is_aggressor : (typeof metadata.is_aggressor === "boolean" ? metadata.is_aggressor : null);
     metadata.hand_result = ev.hand_result ?? metadata.hand_result ?? null;
@@ -568,14 +956,16 @@ function queue(tableId, ev) {
     metadata.status_raw = ev.status_raw ?? metadata.status_raw ?? null;
     metadata.previous_status = ev.previous_status ?? metadata.previous_status ?? null;
     metadata.raw_event_type = ev.raw_event_type ?? metadata.raw_event_type ?? ev.type ?? null;
-    metadata.board_cards = Array.isArray(ev.board_cards) ? ev.board_cards : (Array.isArray(metadata.board_cards) ? metadata.board_cards : null);
-    metadata.players_snapshot_light = Array.isArray(ev.players_snapshot_light)
-        ? ev.players_snapshot_light
-        : (Array.isArray(metadata.players_snapshot_light) ? metadata.players_snapshot_light : null);
+    metadata.board_cards = includeBoard
+        ? (Array.isArray(ev.board_cards) ? ev.board_cards : (Array.isArray(metadata.board_cards) ? metadata.board_cards : null))
+        : null;
+    metadata.players_snapshot_light = includeSnapshot
+        ? (Array.isArray(ev.players_snapshot_light) ? ev.players_snapshot_light : (Array.isArray(metadata.players_snapshot_light) ? metadata.players_snapshot_light : null))
+        : null;
 
     STATE.eventQueue.push({
         table_id: String(tableId),
-        type: String(ev.type || "").toLowerCase(),
+        type: eventType,
         player_id: ev.player_id ?? null,
         player_name: ev.player_name ?? null,
         amount: ev.amount ?? null,
@@ -598,12 +988,14 @@ function emitEvent(tableId, player, type, extra = {}) {
     const eventType = String(type || "").toLowerCase();
     if (!ALLOWED_TYPES.has(eventType)) return;
 
-    const metadataPlayers = cloneLightPlayers(table.playersById);
-    const boardCards = Array.isArray(extra.board_cards) ? extra.board_cards : extractBoardCards(extra.msg || {});
-    const previousStatus = extra.previous_status ?? null;
+    const metadataPlayers = shouldIncludePlayersSnapshot(eventType) ? cloneLightPlayers(table.playersById) : null;
+    const rawBoardCards = Array.isArray(extra.board_cards) ? extra.board_cards : extractBoardCards(extra.msg || {});
+    const street = extra.street || table.currentStreet || "preflop";
+    const boardCards = shouldIncludeBoardCards(eventType, street, rawBoardCards) ? rawBoardCards : null;
     const statusRaw = extra.status_raw ?? player?.status ?? null;
     const handResult = extra.hand_result ?? inferHandResult(eventType, statusRaw);
-    const street = extra.street || table.currentStreet || "preflop";
+    const previousStatusRaw = extra.previous_status ?? null;
+    const previousStatus = sanitizePreviousStatus(previousStatusRaw, street);
     const actionIndex = Number.isFinite(extra.action_index) ? extra.action_index : table.actionIndex || 0;
 
     queue(tableId, {
@@ -727,7 +1119,9 @@ function ensureHudStyles() {
             left: 50%;
             top: 50%;
             transform: translate(-50%, -50%);
-            width: min(320px, calc(100vw - 22px));
+            width: min(360px, calc(100vw - 22px));
+            max-height: calc(100vh - 30px);
+            overflow-y: auto;
             background: linear-gradient(180deg, rgba(15,23,42,0.98), rgba(9,14,24,0.98));
             color: #fff;
             border-radius: 16px;
@@ -773,17 +1167,6 @@ function ensureHudStyles() {
             overflow: hidden;
             text-overflow: ellipsis;
         }
-        .atpu-detail-badge {
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            padding: 4px 8px;
-            border-radius: 999px;
-            font-size: 10px;
-            font-weight: 800;
-            border: 1px solid rgba(255,255,255,0.14);
-            background: rgba(255,255,255,0.06);
-        }
         .atpu-detail-close {
             width: 28px;
             height: 28px;
@@ -823,11 +1206,95 @@ function ensureHudStyles() {
             overflow: hidden;
             text-overflow: ellipsis;
         }
-        .atpu-detail-foot {
-            margin-top: 10px;
-            color: #94a3b8;
+        .atpu-note-wrap {
+            margin-top: 12px;
+            padding: 10px;
+            border-radius: 12px;
+            background: rgba(255,255,255,0.04);
+            border: 1px solid rgba(255,255,255,0.06);
+        }
+        .atpu-note-row {
+            display: grid;
+            gap: 8px;
+            margin-top: 8px;
+        }
+        .atpu-note-wrap input,
+        .atpu-note-wrap textarea {
+            width: 100%;
+            border: 1px solid rgba(255,255,255,0.10);
+            background: rgba(0,0,0,0.25);
+            color: #fff;
+            border-radius: 10px;
+            padding: 9px;
+            font: inherit;
+            outline: none;
+        }
+        .atpu-note-wrap textarea {
+            min-height: 78px;
+            resize: vertical;
+        }
+        .atpu-note-actions {
+            display: flex;
+            gap: 8px;
+            margin-top: 8px;
+        }
+        .atpu-note-actions button {
+            flex: 1;
+            border: 0;
+            border-radius: 10px;
+            padding: 9px 10px;
+            font-weight: 700;
+            cursor: pointer;
+        }
+        .atpu-note-save {
+            background: #15803d;
+            color: #fff;
+        }
+        .atpu-note-reload {
+            background: #334155;
+            color: #fff;
+        }
+        .atpu-note-status {
+            margin-top: 8px;
             font-size: 11px;
+            color: #94a3b8;
             line-height: 1.3;
+        }
+        .atpu-note-tag-preview {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 4px 8px;
+            border-radius: 999px;
+            font-size: 10px;
+            font-weight: 800;
+            border: 1px solid rgba(255,255,255,0.12);
+            background: rgba(255,255,255,0.06);
+            margin-top: 4px;
+            max-width: 100%;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .atpu-color-row {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            margin-top: 2px;
+        }
+        .atpu-color-chip {
+            width: 24px;
+            height: 24px;
+            border-radius: 999px;
+            border: 2px solid rgba(255,255,255,0.18);
+            cursor: pointer;
+            padding: 0;
+            outline: none;
+            box-shadow: inset 0 0 0 1px rgba(0,0,0,0.15);
+        }
+        .atpu-color-chip.active {
+            border-color: #fff;
+            box-shadow: 0 0 0 2px rgba(255,255,255,0.14), inset 0 0 0 1px rgba(0,0,0,0.15);
         }
     `;
 
@@ -845,7 +1312,8 @@ function getHudState(playerId) {
             boxEl: null,
             isFaded: false,
             lastTapAt: 0,
-            suppressClickUntil: 0
+            suppressClickUntil: 0,
+            missingCount: 0
         };
     }
     return HUD_STATE[key];
@@ -881,7 +1349,16 @@ function cleanupStaleHud(validPlayerIds) {
         const hudEl = st && st.hudEl;
         const hudInDom = !!(hudEl && hudEl.isConnected);
         const box = document.getElementById("player-" + id);
-        if (!keep.has(id) || !hudInDom || !box) removeHud(id);
+
+        if (keep.has(id) && hudInDom && box) {
+            st.missingCount = 0;
+            return;
+        }
+
+        st.missingCount = Number(st.missingCount || 0) + 1;
+        if (st.missingCount >= 3) {
+            removeHud(id);
+        }
     });
 }
 
@@ -922,7 +1399,7 @@ function pulseMiniHud(playerId) {
 }
 
 function buildDetailMetric(label, value) {
-    return `<div class="atpu-detail-item"><span class="atpu-detail-label">${label}</span><span class="atpu-detail-value">${value}</span></div>`;
+    return `<div class="atpu-detail-item"><span class="atpu-detail-label">${escapeHtml(label)}</span><span class="atpu-detail-value">${escapeHtml(value)}</span></div>`;
 }
 
 function ensureDetailCardMounted() {
@@ -949,10 +1426,189 @@ function ensureDetailCardMounted() {
 
 function closeDetailCard() {
     if (!DETAIL_CARD_STATE.mounted || !DETAIL_CARD_STATE.backdrop || !DETAIL_CARD_STATE.card) return;
+    captureDetailDraftFromDom();
     DETAIL_CARD_STATE.backdrop.classList.remove("atpu-open");
     DETAIL_CARD_STATE.backdrop.style.display = "none";
     DETAIL_CARD_STATE.card.classList.remove("atpu-detail-from-flip");
     DETAIL_CARD_STATE.activePlayerId = null;
+    DETAIL_CARD_STATE.lastFlashMessage = "";
+}
+
+function getDetailCardTagPreview(tagText, colorText) {
+    if (!tagText) return "";
+    const color = colorText || "#cbd5e1";
+    return `<div class="atpu-note-tag-preview" style="color:${escapeHtml(color)};">${escapeHtml(tagText)}</div>`;
+}
+
+function renderColorChips(activeColor) {
+    return `
+        <div class="atpu-color-row">
+            ${COLOR_PRESETS.map(color => `
+                <button
+                    type="button"
+                    class="atpu-color-chip ${activeColor === color ? "active" : ""}"
+                    data-color="${escapeHtml(color)}"
+                    style="background:${escapeHtml(color)};"
+                    title="${escapeHtml(color)}"
+                ></button>
+            `).join("")}
+        </div>
+    `;
+}
+
+function bindDetailDraftInputs(playerId) {
+    if (!DETAIL_CARD_STATE.card) return;
+
+    const id = String(playerId);
+    const tagInput = DETAIL_CARD_STATE.card.querySelector("#atpu-detail-tag");
+    const noteInput = DETAIL_CARD_STATE.card.querySelector("#atpu-detail-note");
+    const colorHidden = DETAIL_CARD_STATE.card.querySelector("#atpu-detail-color-hidden");
+    const chips = DETAIL_CARD_STATE.card.querySelectorAll(".atpu-color-chip");
+    const statusEl = DETAIL_CARD_STATE.card.querySelector("#atpu-detail-note-status");
+
+    function markDirty() {
+        const draft = getDetailDraft(id);
+        draft.tag_text = String(tagInput?.value || "").slice(0, 32);
+        draft.note_text = String(noteInput?.value || "").slice(0, 150);
+        draft.color_text = String(colorHidden?.value || "");
+        draft.dirty = true;
+        if (statusEl) statusEl.textContent = "Unsaved changes.";
+    }
+
+    if (tagInput) tagInput.addEventListener("input", markDirty);
+    if (noteInput) noteInput.addEventListener("input", markDirty);
+
+    chips.forEach(btn => {
+        btn.addEventListener("click", (e) => {
+            e.preventDefault();
+            const color = btn.getAttribute("data-color") || "";
+            if (colorHidden) colorHidden.value = color;
+            chips.forEach(ch => ch.classList.toggle("active", ch === btn));
+            markDirty();
+        });
+    });
+}
+
+function renderDetailCard(playerId, flashMessage) {
+    const id = String(playerId);
+    const stats = PLAYER_STATS[id];
+    const table = ensureTable(STATE.activeTableId || "");
+    const livePlayer = table && table.playersById ? table.playersById[id] : null;
+    const note = ensurePlayerNote(id);
+
+    if (!stats || !livePlayer || !DETAIL_CARD_STATE.card) return;
+
+    captureDetailDraftFromDom();
+
+    const draft = getDetailDraft(id);
+    if (!draft.dirty) {
+        syncDraftFromNote(id, false);
+    }
+
+    const hands = stats.hands || 0;
+    const vpip = hands ? (stats.vpipHands / hands * 100) : 0;
+    const pfr = hands ? (stats.pfrHands / hands * 100) : 0;
+
+    const raw = stats.raw || {};
+    const af = raw.af ?? "-";
+    const threebet = raw.three_bet_pct ?? raw.threebet ?? raw["3bet"] ?? "-";
+    const cbet = raw.cbet_flop_pct ?? raw.cbet_flop ?? "-";
+    const wtsd = raw.wtsd_pct ?? raw.wtsd ?? "-";
+    const wsd = raw.wsd_pct ?? raw.wsd ?? "-";
+    const limpPct = raw.limp_pct ?? "-";
+    const profileText = raw.profile_text || "-";
+    const avgStack = raw.avg_stack != null ? "$" + formatMoneyShort(raw.avg_stack) : "-";
+    const style = getStyle(vpip, pfr, hands);
+
+    const noteStatusText = note.loading
+        ? "Loading player note..."
+        : note.error
+            ? "Note request failed."
+            : flashMessage
+                ? flashMessage
+                : draft.dirty
+                    ? "Unsaved changes."
+                    : note.updated_at
+                        ? `Last update: ${new Date(note.updated_at).toLocaleString()}`
+                        : "No personal note saved.";
+
+    DETAIL_CARD_STATE.card.innerHTML = `
+        <div class="atpu-detail-head">
+            <div class="atpu-detail-title">
+                <strong>
+                    ${escapeHtml(stats.name || ("ID " + id))}
+                    <span style="margin-left:6px;color:${style.c};font-size:11px;">${escapeHtml(style.l)}</span>
+                </strong>
+                <span style="font-size:11px;color:#94a3b8;">Player ID: ${escapeHtml(id)}</span>
+                ${getDetailCardTagPreview(draft.tag_text, draft.color_text)}
+            </div>
+            <button class="atpu-detail-close" type="button">×</button>
+        </div>
+
+        <div class="atpu-detail-grid">
+            ${buildDetailMetric("HANDS", hands)}
+            ${buildDetailMetric("VPIP", vpip.toFixed(0) + "%")}
+            ${buildDetailMetric("PFR", pfr.toFixed(0) + "%")}
+            ${buildDetailMetric("AF", String(af))}
+            ${buildDetailMetric("3B", String(threebet))}
+            ${buildDetailMetric("CBET", String(cbet))}
+            ${buildDetailMetric("WTSD", String(wtsd))}
+            ${buildDetailMetric("WSD", String(wsd))}
+            ${buildDetailMetric("LIMP", String(limpPct))}
+            ${buildDetailMetric("STACK", livePlayer.stack ? "$" + formatMoneyShort(livePlayer.stack) : "-")}
+            ${buildDetailMetric("AVG STACK", avgStack)}
+            ${buildDetailMetric("PROFILE", profileText)}
+        </div>
+
+        <div class="atpu-note-wrap">
+            <div class="atpu-detail-label">Personal player info</div>
+
+            <div class="atpu-note-row">
+                <input id="atpu-detail-tag" maxlength="32" placeholder="Tag" value="${escapeHtml(draft.tag_text || "")}">
+                <input id="atpu-detail-color-hidden" type="hidden" value="${escapeHtml(draft.color_text || COLOR_PRESETS[0])}">
+                ${renderColorChips(draft.color_text || COLOR_PRESETS[0])}
+                <textarea id="atpu-detail-note" maxlength="150" placeholder="Personal note (max 150)">${escapeHtml(draft.note_text || "")}</textarea>
+            </div>
+
+            <div class="atpu-note-actions">
+                <button type="button" class="atpu-note-save" id="atpu-detail-save">Save</button>
+                <button type="button" class="atpu-note-reload" id="atpu-detail-reload">Reload</button>
+            </div>
+
+            <div class="atpu-note-status" id="atpu-detail-note-status">${escapeHtml(noteStatusText)}</div>
+        </div>
+    `;
+
+    const closeBtn = DETAIL_CARD_STATE.card.querySelector(".atpu-detail-close");
+    const saveBtn = DETAIL_CARD_STATE.card.querySelector("#atpu-detail-save");
+    const reloadBtn = DETAIL_CARD_STATE.card.querySelector("#atpu-detail-reload");
+
+    if (closeBtn) closeBtn.onclick = closeDetailCard;
+
+    bindDetailDraftInputs(id);
+
+    if (reloadBtn) {
+        reloadBtn.onclick = () => {
+            const draftRef = getDetailDraft(id);
+            draftRef.dirty = false;
+            loadPlayerNote(id, true, () => {
+                syncDraftFromNote(id, true);
+                safeRefreshActiveDetailCard(id, "Reloaded.", true);
+            });
+        };
+    }
+
+    if (saveBtn) {
+        saveBtn.onclick = () => {
+            captureDetailDraftFromDom();
+            const currentDraft = getDetailDraft(id);
+            savePlayerNote(id, {
+                tag_text: currentDraft.tag_text,
+                color_text: currentDraft.color_text,
+                note_text: currentDraft.note_text
+            });
+        };
+    }
 }
 
 function openDetailCard(playerId, preferFlip) {
@@ -963,52 +1619,12 @@ function openDetailCard(playerId, preferFlip) {
     if (!stats || !livePlayer) return;
 
     ensureDetailCardMounted();
-
-    const hands = stats.hands || 0;
-    const vpip = hands ? (stats.vpipHands / hands * 100) : 0;
-    const pfr = hands ? (stats.pfrHands / hands * 100) : 0;
-
-    const raw = stats.raw || {};
-
-    const af = raw.af ?? raw.aggression ?? "-";
-    const threebet = raw.threebet ?? raw["3bet"] ?? "-";
-    const cbet = raw.cbet_flop ?? "-";
-    const wtsd = raw.wtsd ?? "-";
-    const wsd = raw.wsd ?? "-";
-
-    const style = getStyle(vpip, pfr, hands);
-
-    DETAIL_CARD_STATE.card.innerHTML = `
-        <div class="atpu-detail-head">
-            <div class="atpu-detail-title">
-                <strong>
-                    ${stats.name || ("ID " + id)}
-                    <span style="margin-left:6px;color:${style.c};font-size:11px;">${style.l}</span>
-                </strong>
-            </div>
-            <button class="atpu-detail-close" type="button">×</button>
-        </div>
-
-        <div class="atpu-detail-grid">
-            ${buildDetailMetric("HANDS", hands)}
-            ${buildDetailMetric("VPIP", vpip.toFixed(0) + "%")}
-            ${buildDetailMetric("PFR", pfr.toFixed(0) + "%")}
-
-            ${buildDetailMetric("AF", af)}
-            ${buildDetailMetric("3B", threebet)}
-            ${buildDetailMetric("CBET", cbet)}
-
-            ${buildDetailMetric("WTSD", wtsd)}
-            ${buildDetailMetric("WSD", wsd)}
-            ${buildDetailMetric("STACK", livePlayer.stack ? "$" + formatMoneyShort(livePlayer.stack) : "-")}
-        </div>
-    `;
-
-    const closeBtn = DETAIL_CARD_STATE.card.querySelector(".atpu-detail-close");
-    if (closeBtn) closeBtn.onclick = closeDetailCard;
+    syncDraftFromNote(id, false);
 
     DETAIL_CARD_STATE.activePlayerId = id;
     DETAIL_CARD_STATE.lastOpenAt = Date.now();
+
+    renderDetailCard(id);
 
     DETAIL_CARD_STATE.backdrop.style.display = "block";
     DETAIL_CARD_STATE.backdrop.classList.add("atpu-open");
@@ -1018,6 +1634,12 @@ function openDetailCard(playerId, preferFlip) {
         void DETAIL_CARD_STATE.card.offsetWidth;
         DETAIL_CARD_STATE.card.classList.add("atpu-detail-from-flip");
     }
+
+    loadPlayerNote(id, false, () => {
+        if (getDetailDraft(id).dirty) return;
+        syncDraftFromNote(id, false);
+        safeRefreshActiveDetailCard(id, "", true);
+    });
 }
 
 function bindMiniHudEvents(playerId) {
@@ -1087,6 +1709,7 @@ function bindMiniHudEvents(playerId) {
 function getPlayerHudSignature(stats, livePlayer) {
     const vpip = stats.hands ? (stats.vpipHands / stats.hands * 100) : 0;
     const pfr = stats.hands ? (stats.pfrHands / stats.hands * 100) : 0;
+    const note = ensurePlayerNote(livePlayer?.id || "");
     const style = getStyle(vpip, pfr, stats.hands);
     return [
         style.l,
@@ -1094,7 +1717,9 @@ function getPlayerHudSignature(stats, livePlayer) {
         vpip.toFixed(0),
         pfr.toFixed(0),
         livePlayer && livePlayer.stack != null ? livePlayer.stack : "-",
-        livePlayer && livePlayer.status ? livePlayer.status : "-"
+        livePlayer && livePlayer.status ? livePlayer.status : "-",
+        note.tag_text || "",
+        note.color_text || ""
     ].join("|");
 }
 
@@ -1103,6 +1728,7 @@ function renderMiniHudForPlayer(box, playerId, stats, livePlayer) {
 
     const st = getHudState(playerId);
     st.boxEl = box;
+    st.missingCount = 0;
 
     let hud = st.hudEl;
     if (!hud || !hud.isConnected || hud.parentNode !== box) {
@@ -1120,21 +1746,20 @@ function renderMiniHudForPlayer(box, playerId, stats, livePlayer) {
     const vpip = stats.hands ? (stats.vpipHands / stats.hands * 100) : 0;
     const pfr = stats.hands ? (stats.pfrHands / stats.hands * 100) : 0;
     const style = getStyle(vpip, pfr, stats.hands);
+    const note = ensurePlayerNote(playerId);
     const signature = getPlayerHudSignature(stats, livePlayer);
 
     hud.style.display = STATE.hudVisible ? "block" : "none";
     if (!STATE.hudVisible) return;
 
-    hud.style.color = style.c;
-    hud.textContent = style.l;
-    hud.title = `${stats.name || ("ID " + playerId)} • ${style.l}`;
+    hud.style.color = note.tag_text && note.color_text ? note.color_text : style.c;
+    hud.textContent = note.tag_text ? String(note.tag_text).slice(0, 8) : style.l;
+    hud.title = `${stats.name || ("ID " + playerId)} • ${note.tag_text ? note.tag_text : style.l}`;
 
     if (st.lastSignature !== signature) {
         st.lastSignature = signature;
         scheduleHudFade(playerId, true);
-        if (DETAIL_CARD_STATE.activePlayerId === String(playerId) && DETAIL_CARD_STATE.backdrop && DETAIL_CARD_STATE.backdrop.classList.contains("atpu-open")) {
-            openDetailCard(playerId, false);
-        }
+        safeRefreshActiveDetailCard(playerId, "", false);
     } else if (st.isFaded) {
         hud.classList.add("atpu-mini-faded");
         hud.classList.remove("atpu-mini-active");
@@ -1154,10 +1779,7 @@ function renderHUD() {
         if (!stats) return;
 
         const livePlayer = currentTable && currentTable.playersById ? currentTable.playersById[id] : null;
-        if (!livePlayer) {
-            removeHud(id);
-            return;
-        }
+        if (!livePlayer) return;
 
         validPlayerIds.push(id);
         renderMiniHudForPlayer(box, id, stats, livePlayer);
@@ -1172,6 +1794,8 @@ function emitHandDealtIfNeeded(tableId) {
 
     const boardCards = [];
     Object.values(table.playersById).forEach(player => {
+        if (!isEligibleForHandDealt(player)) return;
+
         emitEvent(tableId, player, "hand_dealt", {
             street: "preflop",
             action_index: 0,
@@ -1195,6 +1819,7 @@ function emitSawFlopIfNeeded(tableId, boardCards) {
 
     Object.values(table.playersById).forEach(player => {
         if (player.folded) return;
+        if (isExcludedStatus(player.status)) return;
         if (table.sawFlopEmitted[player.id]) return;
 
         emitEvent(tableId, player, "saw_flop", {
@@ -1214,11 +1839,19 @@ function emitSawFlopIfNeeded(tableId, boardCards) {
 }
 
 function maybeEmitPreflopAdvanced(tableId, table, player, prev, type, commonMeta) {
+    if ((table.currentStreet || "preflop") !== "preflop") return;
+
     const playerId = String(player.id);
     const handKey = table.currentHandId || "nohand";
 
-    if ((type === "call_preflop" || type === "fold") && table.preflopRaiseCount >= 1) {
-        const key = `${tableId}|${handKey}|faced_raise_preflop|${playerId}|${table.actionIndex}`;
+    const hasPriorRaise = table.preflopRaiseCount >= 1 &&
+        table.preflopLastRaiseActorId &&
+        String(table.preflopLastRaiseActorId) !== playerId &&
+        table.preflopLastRaiseActionIndex > 0 &&
+        commonMeta.action_index > table.preflopLastRaiseActionIndex;
+
+    if ((type === "call_preflop" || type === "fold") && hasPriorRaise) {
+        const key = `${tableId}|${handKey}|faced_raise_preflop|${playerId}|raiseLvl:${table.preflopRaiseCount}|raiser:${table.preflopLastRaiseActorId}`;
         if (!table.facedRaisePreflopEmitted[key]) {
             emitEvent(tableId, player, "faced_raise_preflop", commonMeta);
             table.facedRaisePreflopEmitted[key] = true;
@@ -1255,18 +1888,28 @@ function maybeEmitPreflopAdvanced(tableId, table, player, prev, type, commonMeta
         }
     }
 
-    const isBbSeat = String(player.seat || "").toLowerCase() === "bb";
-    const isLateStealPressure = table.preflopRaiseCount >= 1;
+    const playerSeat = String(player.seat ?? "");
+    const activePlayers = Object.values(table.playersById)
+        .filter(p => !p.folded && !isExcludedStatus(p.status));
+
+    const sortedSeats = activePlayers
+        .map(p => String(p.seat ?? ""))
+        .filter(Boolean)
+        .sort((a, b) => Number(a) - Number(b));
+
+    const bbSeat = sortedSeats.length ? sortedSeats[sortedSeats.length - 1] : null;
+    const isBbSeat = bbSeat !== null && playerSeat === bbSeat;
+    const isLateStealPressure = hasPriorRaise;
 
     if (isBbSeat && isLateStealPressure) {
-        const facedStealKey = `${tableId}|${handKey}|faced_steal_bb|${playerId}|${table.actionIndex}`;
+        const facedStealKey = `${tableId}|${handKey}|faced_steal_bb|${playerId}|${table.actionIndex}|raiseLvl:${table.preflopRaiseCount}`;
         if (!table.facedStealBbEmitted[facedStealKey]) {
             emitEvent(tableId, player, "faced_steal_bb", commonMeta);
             table.facedStealBbEmitted[facedStealKey] = true;
         }
 
         if (type === "fold") {
-            const foldStealKey = `${tableId}|${handKey}|fold_bb_to_steal|${playerId}|${table.actionIndex}`;
+            const foldStealKey = `${tableId}|${handKey}|fold_bb_to_steal|${playerId}|${table.actionIndex}|raiseLvl:${table.preflopRaiseCount}`;
             if (!table.foldBbToStealEmitted[foldStealKey]) {
                 emitEvent(tableId, player, "fold_bb_to_steal", commonMeta);
                 table.foldBbToStealEmitted[foldStealKey] = true;
@@ -1275,7 +1918,7 @@ function maybeEmitPreflopAdvanced(tableId, table, player, prev, type, commonMeta
     }
 
     const othersStillIn =
-        Object.values(table.playersById).filter(p => !p.folded && String(p.id) !== playerId).length;
+        Object.values(table.playersById).filter(p => !p.folded && !isExcludedStatus(p.status) && String(p.id) !== playerId).length;
 
     if ((type === "raise_preflop" || type === "allin") && table.preflopRaiseCount >= 2 && othersStillIn >= 2) {
         const sqOppKey = `${tableId}|${handKey}|squeeze_opportunity|${playerId}|${table.actionIndex}`;
@@ -1349,7 +1992,6 @@ function maybeEmitFlopAdvanced(tableId, table, player, type, commonMeta) {
 
 function maybeEmitShowdownWin(tableId, table, player, type, commonMeta) {
     const playerId = String(player.id);
-    const handKey = table.currentHandId || "nohand";
 
     if (type === "win" || commonMeta.hand_result === "win" || String(commonMeta.status_raw || "").toLowerCase().includes("winner")) {
         if (!table.winShowdownEmitted[playerId]) {
@@ -1367,7 +2009,7 @@ function maybeEmitShowdownWin(tableId, table, player, type, commonMeta) {
 
     const boardCards = commonMeta.board_cards || [];
     if (boardCards.length >= 5 && (type === "win" || String(commonMeta.status_raw || "").toLowerCase().includes("showdown"))) {
-        const keySd = `${tableId}|${handKey}|showdown|${playerId}`;
+        const keySd = `${tableId}|${table.currentHandId || "nohand"}|showdown|${playerId}`;
         if (!table.showdownEmitted[keySd]) {
             emitEvent(tableId, player, "showdown", commonMeta);
             table.showdownEmitted[keySd] = true;
@@ -1387,18 +2029,21 @@ function detectActions(tableId, table, oldPlayers, msg) {
         const oldStatus = String(prev.status || "").trim();
         const newStatus = String(player.status || "").trim();
         if (!oldStatus || !newStatus || oldStatus === newStatus) return;
+        if (shouldIgnoreTransition(oldStatus, newStatus, player, table)) return;
 
         let type = mapStatusToType(newStatus);
         if (!type) return;
 
         if (table.currentStreet === "preflop" && type === "call") type = "call_preflop";
         if (table.currentStreet === "preflop" && type === "raise") type = "raise_preflop";
+        if (table.currentStreet === "preflop" && type === "bet") type = "raise_preflop";
 
-        const dedupeKey = `${tableId}_${player.id}_${type}_${table.currentHandId || "nohand"}_${table.currentStreet || "nostreet"}_${table.actionIndex}`;
+        const nextActionIndex = Number(table.actionIndex || 0) + 1;
+        const dedupeKey = `${tableId}_${player.id}_${type}_${table.currentHandId || "nohand"}_${table.currentStreet || "nostreet"}_${nextActionIndex}`;
         if (LAST_ACTION[dedupeKey]) return;
         LAST_ACTION[dedupeKey] = true;
 
-        table.actionIndex = Number(table.actionIndex || 0) + 1;
+        table.actionIndex = nextActionIndex;
         table.streetActionIndex = Number(table.streetActionIndex || 0) + 1;
 
         const isAggressor = type === "raise" || type === "raise_preflop" || type === "bet" || type === "allin";
@@ -1441,6 +2086,8 @@ function detectActions(tableId, table, oldPlayers, msg) {
             if (table.currentStreet === "preflop") {
                 if (!table.preflopAggressorId) table.preflopAggressorId = player.id;
                 table.preflopRaiseCount += 1;
+                table.preflopLastRaiseActorId = String(player.id);
+                table.preflopLastRaiseActionIndex = table.actionIndex;
             }
         }
 
@@ -1477,6 +2124,7 @@ function updatePlayersFromState(tableId, msg) {
             folded: String(p.status || "").toLowerCase().includes("fold")
         };
         ensurePlayerStats(uid, name);
+        ensurePlayerNote(uid);
     });
 
     table.playersById = fresh;
@@ -1508,6 +2156,7 @@ function updateFromUpdatePlayer(tableId, msg) {
             folded: String(p.status || "").toLowerCase().includes("fold")
         };
         ensurePlayerStats(uid, name);
+        ensurePlayerNote(uid);
     });
 
     detectActions(tableId, table, oldPlayers, msg);
@@ -1814,11 +2463,11 @@ function boot() {
         mountButton();
         autoAuthorizeFromLocalKey();
 
-        setInterval(flush, 3000);
-        setInterval(renderHUD, 1000);
-        setInterval(loadStatsFromServer, 5000);
+        setInterval(flush, 15000);
+        setInterval(renderHUD, 2500);
+        setInterval(loadStatsFromServer, 30000);
         setInterval(autoAuthorizeFromLocalKey, 15000);
-        setInterval(renderMenuStatus, 2000);
+        setInterval(renderMenuStatus, 3000);
     });
 }
 
